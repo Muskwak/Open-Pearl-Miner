@@ -199,7 +199,7 @@ class JSONRPCClient:
 
 
 class MiningClient:
-    """Mining-specific wrapper around JSONRPCClient."""
+    """Mining-specific wrapper around JSONRPCClient (pearl-gateway protocol)."""
 
     def __init__(self, host: str, port: int):
         self.client = JSONRPCClient(host, port)
@@ -216,3 +216,100 @@ class MiningClient:
 
     def close(self):
         self.client.close()
+
+
+class PoolChallenge:
+    """Represents a challenge received from the pool."""
+
+    def __init__(self, seed: bytes, difficulty: int):
+        self.seed = seed
+        self.difficulty = difficulty
+
+    @classmethod
+    def from_json(cls, data: dict) -> PoolChallenge:
+        return cls(
+            seed=bytes.fromhex(data["seed"]),
+            difficulty=data["difficulty"],
+        )
+
+
+class AlphaPoolClient:
+    """Client for the AlphaPool custom Stratum protocol.
+
+    Protocol: pool sends ``pearl.challenge`` immediately on connect and in
+    response to any message.  The miner submits shares via ``mining.submit``.
+    """
+
+    def __init__(self, host: str, port: int, wallet: str, worker: str = "default"):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.settimeout(30)
+        self._sock.connect((host, port))
+        self._reader = self._sock.makefile("r", encoding="utf-8")
+        self._writer = self._sock.makefile("w", encoding="utf-8")
+        self._request_id = 0
+        self.wallet = wallet
+        self.worker = worker
+
+    def close(self):
+        self._reader.close()
+        self._writer.close()
+        self._sock.close()
+
+    def _send(self, method: str, params: Any = None) -> int:
+        self._request_id += 1
+        req = {"id": self._request_id, "method": method, "params": params or []}
+        self._writer.write(json.dumps(req) + "\n")
+        self._writer.flush()
+        return self._request_id
+
+    def _read_line(self, timeout: float = 5) -> dict | None:
+        self._sock.settimeout(timeout)
+        try:
+            line = self._reader.readline()
+            if not line:
+                return None
+            return json.loads(line.strip())
+        except socket.timeout:
+            return None
+
+    def _drain_notifications(self, timeout: float = 0.5) -> list[dict]:
+        msgs: list[dict] = []
+        while True:
+            msg = self._read_line(timeout)
+            if msg is None:
+                break
+            msgs.append(msg)
+        return msgs
+
+    def recv_challenge(self, timeout: float = 5) -> PoolChallenge | None:
+        msg = self._read_line(timeout)
+        if msg is None:
+            return None
+        if msg.get("method") == "pearl.challenge":
+            return PoolChallenge.from_json(msg["params"])
+        return None
+
+    def submit_share(self, proof_base64: str, seed_hex: str) -> bool | None:
+        """Submit a share to the pool.
+
+        Returns True if accepted, False if rejected, None if no response.
+        """
+        params = [f"{self.wallet}.{self.worker}", seed_hex, proof_base64]
+        req_id = self._send("mining.submit", params)
+        self._sock.settimeout(10)
+        while True:
+            line = self._reader.readline()
+            if not line:
+                return None
+            resp = json.loads(line.strip())
+            if resp.get("id") == req_id:
+                if resp.get("result") is True:
+                    return True
+                return False
+            # ignore notifications (new challenges etc.)
+
+    def subscribe(self):
+        self._send("mining.subscribe", ["pearl-miner/1.0.0"])
+
+    def authorize(self, password: str = "x"):
+        self._send("mining.authorize", [self.wallet, password])

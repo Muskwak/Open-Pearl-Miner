@@ -149,6 +149,38 @@ def default_mining_config(m: int, k: int, rank: int = NOISE_RANK) -> MiningConfi
     )
 
 
+def pool_target(difficulty: int, config: MiningConfiguration) -> int:
+    """Convert pool difficulty (leading-zero-bits count) to U256 target.
+
+    The pool's difficulty is the number of leading zero bits required in the
+    final jackpot hash.  This is multiplied by the difficulty-adjustment factor
+    (tile_size × dot_product_length) per the Rust ``extract_difficulty_bound``,
+    so the actual target checked against the hash is easier than the raw
+    bit count would imply.  Result is clamped to U256::MAX.
+    """
+    raw = 2 ** (256 - difficulty)
+    h = config.hash_tile_h()
+    w = config.hash_tile_w()
+    adj = h * w * config.dot_product_length()
+    result = raw * adj
+    u256_max = (1 << 256) - 1
+    return result if result <= u256_max else u256_max
+
+
+def generate_matrices(
+    m: int, k: int, n: int,
+    signal_min: int = -64, signal_max: int = 64,
+    seed: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Generate random int8 matrices A (m×k) and B (k×n) for mining."""
+    rng = torch.Generator()
+    if seed is not None:
+        rng.manual_seed(seed)
+    A = torch.randint(signal_min, signal_max + 1, (m, k), dtype=torch.int8, generator=rng)
+    B = torch.randint(signal_min, signal_max + 1, (k, n), dtype=torch.int8, generator=rng)
+    return A, B
+
+
 # --------------------------------------------------------------------------- #
 # Pipeline
 # --------------------------------------------------------------------------- #

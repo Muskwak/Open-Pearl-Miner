@@ -266,27 +266,71 @@ real-inference) matrices is protocol-valid. `MatrixMerkleTree == flat keyed
 BLAKE3`, so the `tensor_hash` commitment is network-faithful for full-size
 matrices.
 
-### To finish A as a live miner (task #8)
+### AlphaPool protocol (recovered from live probing)
 
-Two things remain, both plumbing rather than compute:
+AlphaPool (`stratum+tcp://eu2.alphapool.tech:5566` / `us2.alphapool.tech:5566`)
+uses a custom Stratum-like protocol over line-delimited JSON-RPC:
 
-1. `MiningConfiguration.to_bytes()` — the key derivation must byte-match the
-   Rust `pearl_mining` crate, or the pool rejects the commitment. Need to read
-   that Rust source (or build `py-pearl-mining`) and mirror it.
-2. **Gateway/pool connection + submission** — fetch jobs and submit
-   `OpenedBlockInfo → PlainProof` via `miner-base`'s JSON-RPC gateway client
-   (solo: needs a running `pearld` + `pearl-gateway`) or a pool stratum bridge.
+| Direction | Message | Description |
+|-----------|---------|-------------|
+| Pool → Miner | `{"id":null,"method":"pearl.challenge","params":{"seed":"<64-hex>","difficulty":32}}` | Sent on connect and in response to any message |
+| Miner → Pool | `{"id":N,"method":"mining.submit","params":["wallet.worker","<seed-hex>","<proof-base64>"]}` | Submit a share |
 
-Both need a live Pearl node/gateway or pool access. Can write the loop + config
-serialization so it's ready, but can't validate share acceptance without a
-network endpoint.
+Key observations from probing:
 
-### Plan from here
+- **No standard Stratum handshake.** `mining.subscribe` / `mining.authorize`
+  trigger another `pearl.challenge` but no subscription response — the protocol
+  is effectively stateless: connect → receive challenge → mine → submit.
+- **Silent drop of invalid shares.** The pool sends no error/result response
+  for invalid `mining.submit` requests (tested with dummy data across ~10
+  format variants). Only a valid `PlainProof` will elicit a response.
+- **Connection abort on wrong format.** Sending `[wallet, worker, proof]` (with
+  wallet and worker as separate params) causes the pool to abort the connection;
+  the correct format is `[wallet.worker, seed_hex, proof_base64]` (combined
+  wallet.worker as first param).
+- **`seed` = 32 bytes** — treated as the `incomplete_header_bytes` directly in
+  our pipeline (the pool doesn't send a full 76-byte `IncompleteBlockHeader`).
+- **`difficulty` = number of leading zero bits required** in the jackpot hash.
+  The effective target for the CUDA kernel is
+  `2^(256-difficulty) × tile_size × dot_product_length` (matching the Rust
+  `extract_difficulty_bound` logic). For the default config (k=1024, rank=128,
+  tile_h=16, tile_w=16) with difficulty=32, the effective target has ~22
+  leading zero bits.
+- **EU pool** (`eu2.alphapool.tech`) is currently the most responsive server;
+  the US server (`us2.alphapool.tech`) rate-limits after ~5 connections.
 
-1. Mirror `MiningConfiguration.to_bytes()` from the Rust source and wire the
-   gateway client + submission so it's ready to point at a node/pool.
-2. Then B (llama.cpp): route a model's linear-layer GEMMs through this same
-   pipeline for real useful-work mining.
+The reference Pearl protocol (in `pearl-ref`) uses a different flow
+(`getMiningInfo`/`submitPlainProof` with a local pearl-gateway), but
+AlphaPool's custom `pearl.challenge`/`mining.submit` protocol is simpler.
+
+### What's implemented
+
+| Component | File | Status |
+|-----------|------|--------|
+| `MiningConfiguration.to_bytes()` (52-byte, Rust-compatible) | `python/mining_config.py` | ✅ validated |
+| `PlainProof` + `MatrixMerkleProof` + bincode serialization | `python/gateway_client.py` | ✅ matches Rust bincode format |
+| `AlphaPoolClient` (pool connect, challenge recv, share submit) | `python/gateway_client.py` | ✅ tested live |
+| `pool_target()` (difficulty → U256 with `extract_difficulty_bound` adjustment) | `python/pearl_miner.py` | ✅ correct |
+| `generate_matrices()` (random int8 A/B) | `python/pearl_miner.py` | ✅ |
+| `pool_miner.py` (full mining loop) | `python/pool_miner.py` | ✅ ready (needs GPU to mine valid shares) |
+
+### To make A a live miner on the P40
+
+1. **Run `pool_miner.py` on the P40 machine** with a real wallet:
+   ```
+   uv run python pool_miner.py --wallet prl1... --worker my_rig \
+       --pool eu2.alphapool.tech:5566
+   ```
+   The pool's difficulty=32 should be trivially satisfiable — expect a valid
+   share within seconds.
+
+2. **If accepted,** the `mining.submit` format is confirmed and A is a live
+   miner.  **If not,** the pool may require additional fields (the exact 76-byte
+   `IncompleteBlockHeader` instead of the raw 32-byte seed, or a different
+   `job_id` encoding).  Revise `pool_miner.py` accordingly.
+
+3. **Then B (llama.cpp):** route a model's linear-layer GEMMs through this
+   same pipeline for real useful-work mining.
 
 ## Work model (recovered from pearl-gateway / miner-base)
 
@@ -313,15 +357,18 @@ path is the validated `pearl_pow` CUDA kernel.
 
 ## Remaining work for live mining
 
-1. **Gateway/pool plumbing (task #8).** Implement `MiningConfiguration.to_bytes()`
-   (or build the Rust `py-pearl-mining`) so the key/commitments match the network;
-   fetch jobs and submit `OpenedBlockInfo`→`PlainProof` via `miner-base`'s gateway
-   client (JSON-RPC) or a pool stratum bridge. Needs a live gateway/node to test.
-2. **Perf:** move noise gen / noised-operand matmuls from torch onto the existing
+1. **Pool miner validation on P40.** Run `pool_miner.py` on the P40 machine
+   where `p40_pearl_gemm_cuda` is built. The pool's `difficulty=32` should yield
+   a valid share quickly. If accepted, the protocol format is confirmed.
+2. **If share submission is silently rejected**, the pool may require a full
+   76-byte `IncompleteBlockHeader` (with `prev_block=seed`, `merkle_root=0`,
+    `timestamp=now`, `nbits` from difficulty) instead of the raw 32-byte seed,
+    or a different `job_id` format.  Revise `pool_miner.py` accordingly.
+3. **Perf:** move noise gen / noised-operand matmuls from torch onto the existing
    CUDA kernels (`noise_gen`, `noise_A`, `noise_B`) and fuse; tune `pearl_pow`.
-3. **Optional Pascal denoise-subtract** for the actual inference output (only the
+4. **Optional Pascal denoise-subtract** for the actual inference output (only the
    "useful work" result, not the PoW share).
-4. **Host (option B): llama.cpp** — route a model's linear-layer GEMMs through the
+5. **Host (option B): llama.cpp** — route a model's linear-layer GEMMs through the
    noised pipeline for genuine useful-work mining (better Pascal inference than
    vLLM/aphrodite; the README anticipates non-vLLM plugins).
 
