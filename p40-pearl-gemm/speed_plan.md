@@ -56,10 +56,35 @@ it dead in registers) trims the residual MINB4 spill for another ~+3%.
   loads/dp4a is the best single-warp ratio. Going below 0.75 needs operand reuse across
   *multiple* tiles per warp (lever 5).
 
+## What is the bottleneck now? (measured)
+At S=128/MINB4 we run at **100% thread occupancy, ~36% of dp4a peak**. Two probes
+localize the remaining gap:
+- **int2 (LDS.64) shared loads** (SAW=SW+2, conflict-free) halve the inner-loop
+  shared-load instruction count → **no change** (7.54 vs 7.55). So we are *not*
+  LDS-issue-bound.
+- **Block-shape sweep** (8×4, 4×8, 8×2 vs 4×4) → all ≤ 4×4. So we are *not*
+  operand-reuse / global-bandwidth bound.
+Conclusion: the kernel is **dp4a-throughput / barrier-latency bound** — close to the
+practical ceiling of a single-tile-per-warp DP4A design on Pascal. (Real INT8 GEMM on
+GP102 tops out well under the 47-TOPS marketing peak; we also pay for the per-R XOR
+reduction and re-staging barriers.)
+
 ## Remaining levers (priority order)
-1. ~~**Split BLAKE3 into a 2nd kernel**~~ *(DONE — split v0, +3–8% and steadier)*
-2. ~~**Vectorized `int4` shared loads**~~ *(TRIED — net regression from bank conflicts; reverted)*
-3. **Noised-matmul on GPU INT path** *(removes per-region fp32 matmul overhead)*
+1. ~~**Split BLAKE3 into a 2nd kernel**~~ *(DONE — split v0)*
+2. ~~**Decouple staging width S from R**~~ *(DONE — split v1, the big one: 5.95→7.25)*
+3. ~~**Per-warp transcript in shared**~~ *(DONE — +3%, → 7.5)*
+4. ~~**Vectorized shared loads**~~ *(int4 = bank-conflict regression; int2 = wash → not LDS-bound)*
+5. **Double-buffer the stage at S=64 (1 barrier/sub-chunk instead of 2)** *(uncertain;
+   the S-sweep shows occupancy dominates barriers, so likely small)* — overlap the
+   next sub-chunk's global load with current compute using 2 shared buffers sized so
+   total shared ≈ single S=128 (keeps 4 blocks/SM).
+6. **Multi-GPU dispatch (P40 + 1070)** *(the real path to higher aggregate throughput —
+   ~+30-40% of a P40 from the 1070)*
+7. **Two-tiles-per-warp** (0.75→0.5 loads/dp4a) — deprioritized: we're not load-bound,
+   and it forces smaller blocks that drop occupancy.
+
+## Old lever notes
+- **Noised-matmul on GPU INT path** *(removes per-region fp32 matmul overhead)*
    - Replace the `_imatmul_i8` fp32 GEMM (E_AL@E_AR) with the existing `noise_A`/`noise_B`
      INT kernels, or fuse the noise add into the search kernel.
 4. **Multi-GPU dispatch (P40 + 1070)** *(aggregate, highest remaining value)*

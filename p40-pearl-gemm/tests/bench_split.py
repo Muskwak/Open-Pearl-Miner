@@ -46,6 +46,7 @@ print(f"  fused v1 (4x4 MINB2):     {ms:6.2f} ms  {mt:6.3f} Mtiles/s  {th:5.2f} 
 
 for v, name in [(0, "S128 4x4 MINB3"), (1, "S128 4x4 MINB4"), (2, "S64 4x4 MINB4"),
                 (3, "S256 4x4 MINB3"), (4, "S128 4x4 MINB2"), (5, "S64 4x4 MINB3"),
-                (6, "S128 2x4 MINB4")]:
+                (6, "S128 2x4 MINB4"), (7, "S128 8x2 MINB4"), (8, "S128 8x4 MINB2"),
+                (9, "S128 4x8 MINB2")]:
     ms, mt, th = bench(lambda v=v: _C.pearl_pow_split(A, Bt, key, tgt, R, v))
     print(f"  split v{v} ({name:16s}): {ms:6.2f} ms  {mt:6.3f} Mtiles/s  {th:5.2f} TH/s")

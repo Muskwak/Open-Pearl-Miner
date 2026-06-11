@@ -61,8 +61,13 @@ __global__ void __launch_bounds__(WM* WN * 32, MINB) pearl_gemm_only_kernel(
   constexpr int SW = S / 4;          // dp4a words per staged sub-chunk
   constexpr int SUB = R / S;         // sub-chunks per R-wide reduction window
   static_assert(R % S == 0, "S must divide R");
-  // Conflict-free odd stride (coprime to 32).
-  constexpr int SAW = SW + 1;
+  static_assert(SW % 2 == 0, "SW must be even for int2 shared loads");
+  // Even stride so int2 (LDS.64) loads are 8-byte aligned at every even kk.
+  // Bank check (32 banks): inner-loop bank = (2*row + kk) mod 32. A-reads hit 4
+  // distinct rows R0,R0+4,R0+8,R0+12 -> banks 2R0+{0,8,16,24} (distinct);
+  // B-reads step rows by 2 -> banks {0,4,..,28} (distinct). Conflict-free, and
+  // int2 halves the inner-loop LDS instruction count vs scalar LDS.32.
+  constexpr int SAW = SW + 2;
 
   const int tiles_w = n / HT_GO;
   const int blocks_n = tiles_w / WN;
@@ -83,8 +88,8 @@ __global__ void __launch_bounds__(WM* WN * 32, MINB) pearl_gemm_only_kernel(
 #pragma unroll
   for (int e = 0; e < ELT_PER_LANE_GO; ++e) acc[e] = 0;
 
-  __shared__ int sAi[ROWS_A * SAW];
-  __shared__ int sBi[ROWS_B * SAW];
+  __shared__ __align__(16) int sAi[ROWS_A * SAW];
+  __shared__ __align__(16) int sBi[ROWS_B * SAW];
   // Per-warp transcript in shared memory. Only lane 0 of each warp touches its
   // row, so keeping the 16-word transcript here (instead of a per-thread
   // register array the other 31 lanes carry dead) frees ~16 regs/thread —
@@ -125,18 +130,25 @@ __global__ void __launch_bounds__(WM* WN * 32, MINB) pearl_gemm_only_kernel(
       }
       __syncthreads();
 
+      // int2 (LDS.64) loads: fetch 2 dp4a-words per operand per instruction,
+      // halving the inner-loop shared-load instruction count. SAW=SW+2 keeps
+      // these 8-byte aligned and bank-conflict-free (see SAW note above).
 #pragma unroll
-      for (int kk = 0; kk < SW; ++kk) {
-        int a[RM], b[RN];
+      for (int kk = 0; kk < SW; kk += 2) {
+        int2 a2[RM], b2[RN];
 #pragma unroll
-        for (int i = 0; i < RM; ++i) a[i] = ar[i][kk];
+        for (int i = 0; i < RM; ++i)
+          a2[i] = *reinterpret_cast<const int2*>(&ar[i][kk]);
 #pragma unroll
-        for (int j = 0; j < RN; ++j) b[j] = br[j][kk];
+        for (int j = 0; j < RN; ++j)
+          b2[j] = *reinterpret_cast<const int2*>(&br[j][kk]);
 #pragma unroll
         for (int i = 0; i < RM; ++i)
 #pragma unroll
-          for (int j = 0; j < RN; ++j)
-            acc[i * RN + j] = dp4a_go(a[i], b[j], acc[i * RN + j]);
+          for (int j = 0; j < RN; ++j) {
+            int acumm = dp4a_go(a2[i].x, b2[j].x, acc[i * RN + j]);
+            acc[i * RN + j] = dp4a_go(a2[i].y, b2[j].y, acumm);
+          }
       }
     }
     // R-wide reduction window complete: sample the running accumulator.
@@ -201,6 +213,12 @@ void launch_pearl_gemm_only(
         launch_go_cfg<256, 64, 4, 4, 3>(A, Bt, m, n, k, transcript_buffer, stream); break;
       case 6:
         launch_go_cfg<256, 128, 2, 4, 4>(A, Bt, m, n, k, transcript_buffer, stream); break;
+      case 7:  // 8x2 (512 thr): WN=2 less A-reuse, WM=8 more B-reuse
+        launch_go_cfg<256, 128, 8, 2, 4>(A, Bt, m, n, k, transcript_buffer, stream); break;
+      case 8:  // 8x4 (1024 thr): big reuse, ~25KB smem -> 2 blocks = 100%
+        launch_go_cfg<256, 128, 8, 4, 2>(A, Bt, m, n, k, transcript_buffer, stream); break;
+      case 9:  // 4x8 (1024 thr)
+        launch_go_cfg<256, 128, 4, 8, 2>(A, Bt, m, n, k, transcript_buffer, stream); break;
       default:
         launch_go_cfg<256, 128, 4, 4, 3>(A, Bt, m, n, k, transcript_buffer, stream); break;
     }
