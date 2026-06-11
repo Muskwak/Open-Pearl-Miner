@@ -109,21 +109,35 @@ __global__ void __launch_bounds__(WM* WN * 32, MINB) pearl_pow_fused_kernel(
     }
     __syncthreads();
 
-    // each lane updates its 8 cumulative tile cells, then warp-XOR the whole tile
+    // Register-blocked RM x RN micro-tile per lane: per kk load RM A-ints + RN
+    // B-ints and do RM*RN dp4a (outer product). Shared loads per dp4a drop from
+    // 2 to (RM+RN)/(RM*RN)=0.75, with RM*RN independent accumulators for ILP.
+    // The 32 lanes tile the 16x16 hash-tile as (16/RM) x (16/RN) = 4 x 8 blocks.
+    constexpr int RM = 4, RN = 2;            // RM*RN == ELT_PER_LANE (8)
+    const int mtr = lane >> 3;               // micro-tile row 0..3
+    const int mtc = lane & 7;                // micro-tile col 0..7
+    const int* ar[RM];
+    const int* br[RN];
+#pragma unroll
+    for (int i = 0; i < RM; ++i) ar[i] = &sAi[(aRow0 + mtr * RM + i) * SAW];
+#pragma unroll
+    for (int j = 0; j < RN; ++j) br[j] = &sBi[(bRow0 + mtc * RN + j) * SAW];
+#pragma unroll
+    for (int kk = 0; kk < RW; ++kk) {
+      int a[RM], b[RN];
+#pragma unroll
+      for (int i = 0; i < RM; ++i) a[i] = ar[i][kk];
+#pragma unroll
+      for (int j = 0; j < RN; ++j) b[j] = br[j][kk];
+#pragma unroll
+      for (int i = 0; i < RM; ++i)
+#pragma unroll
+        for (int j = 0; j < RN; ++j)
+          acc[i * RN + j] = dp4a_f(a[i], b[j], acc[i * RN + j]);  // cumulative
+    }
     uint32_t lx = 0u;
 #pragma unroll
-    for (int e = 0; e < ELT_PER_LANE; ++e) {
-      const int elem = lane + 32 * e;      // 0..255
-      const int ei = elem >> 4;            // tile row 0..15
-      const int ej = elem & 15;            // tile col 0..15
-      const int* arow = &sAi[(aRow0 + ei) * SAW];
-      const int* brow = &sBi[(bRow0 + ej) * SAW];
-      int part = 0;
-#pragma unroll
-      for (int kk = 0; kk < RW; ++kk) part = dp4a_f(arow[kk], brow[kk], part);
-      acc[e] += part;
-      lx ^= (uint32_t)acc[e];
-    }
+    for (int e = 0; e < ELT_PER_LANE; ++e) lx ^= (uint32_t)acc[e];
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
       lx ^= __shfl_xor_sync(0xffffffffu, lx, off);
