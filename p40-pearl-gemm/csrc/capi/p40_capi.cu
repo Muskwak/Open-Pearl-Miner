@@ -29,6 +29,22 @@ void launch_pearl_gemm_only(const int8_t*, const int8_t*, int, int, int, int,
 void launch_pearl_blake3(const uint32_t*, int, int, const uint32_t*,
                          const uint32_t*, uint8_t*, int*, int*, cudaStream_t);
 
+// =========================== transpose =====================================
+// Logical src is [rows, cols] with src[r,c] = src_base[r*src_ld + col_off + c]
+// (src_ld/col_off let this transpose a column-slice of a wider matrix without a
+// separate copy). Writes dst[cols, rows] with dst[c,r] = src[r,c].
+__global__ void transpose_i8_kernel(const int8_t* __restrict__ src,
+                                    int8_t* __restrict__ dst, int rows, int cols,
+                                    int src_ld, int col_off) {
+  const long total = (long)rows * cols;
+  for (long idx = (long)blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+       idx += (long)gridDim.x * blockDim.x) {
+    const int r = (int)(idx / cols);
+    const int c = (int)(idx % cols);
+    dst[(size_t)c * rows + r] = src[(size_t)r * src_ld + col_off + c];
+  }
+}
+
 // =========================== memory helpers ================================
 P40_API int p40_malloc(void** p, size_t n) { return (int)cudaMalloc(p, n); }
 P40_API int p40_free(void* p) { return (int)cudaFree(p); }
@@ -40,6 +56,20 @@ P40_API int p40_memcpy_dtoh(void* h, const void* d, size_t n) {
 }
 P40_API int p40_memset(void* d, int v, size_t n) { return (int)cudaMemset(d, v, n); }
 P40_API int p40_sync(void) { return (int)cudaDeviceSynchronize(); }
+
+// dst[cols,rows] = transpose of the [rows,cols] logical view of src (a column
+// slice of a row-major matrix with leading dim src_ld, starting at col_off).
+P40_API int p40_transpose_i8(const void* src, void* dst, int rows, int cols,
+                             int src_ld, int col_off) {
+  const long total = (long)rows * cols;
+  int tpb = 256;
+  long blocks = (total + tpb - 1) / tpb;
+  if (blocks > 65535) blocks = 65535;
+  transpose_i8_kernel<<<(unsigned)blocks, tpb>>>((const int8_t*)src,
+                                                 (int8_t*)dst, rows, cols,
+                                                 src_ld, col_off);
+  return (int)cudaGetLastError();
+}
 
 // =========================== kernels =======================================
 
