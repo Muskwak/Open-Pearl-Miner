@@ -44,7 +44,8 @@ print(f"\nM={M} N={N} K={K} R={R}  ({num_tiles} tiles/call)\n")
 ms, mt, th = bench(lambda: _C.pearl_pow_fused(A, Bt, key, tgt, R, 1))
 print(f"  fused v1 (4x4 MINB2):     {ms:6.2f} ms  {mt:6.3f} Mtiles/s  {th:5.2f} TH/s")
 
-for v, name in [(0, "4x4 MINB3"), (1, "4x4 MINB2"), (2, "4x4 MINB1"),
-                (3, "2x2 MINB4"), (4, "2x4 MINB3")]:
+for v, name in [(0, "S128 4x4 MINB3"), (1, "S128 4x4 MINB4"), (2, "S64 4x4 MINB4"),
+                (3, "S256 4x4 MINB3"), (4, "S128 4x4 MINB2"), (5, "S64 4x4 MINB3"),
+                (6, "S128 2x4 MINB4")]:
     ms, mt, th = bench(lambda v=v: _C.pearl_pow_split(A, Bt, key, tgt, R, v))
-    print(f"  split v{v} ({name}):      {ms:6.2f} ms  {mt:6.3f} Mtiles/s  {th:5.2f} TH/s")
+    print(f"  split v{v} ({name:16s}): {ms:6.2f} ms  {mt:6.3f} Mtiles/s  {th:5.2f} TH/s")

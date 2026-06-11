@@ -20,10 +20,22 @@ So **1 Mtile/s ≈ 1.0486 TH/s**. Each tile = 16×16×4096 = 2^20 INT8 MACs = 2^
 | + bank-conflict padding (stride 65) | 2.34 | 2.46 | 5.1× | row stride coprime to 32 banks |
 | + 4×2 register blocking | 3.13 | 3.28 | 6.8× | 0.75 shared-loads/dp4a, ILP |
 | + MINB2 occupancy (fused variant 1) | 5.25 | 5.5 | 11.4× | 2 blocks/SM = 50% occupancy |
-| **+ split BLAKE3 → GEMM-only MINB3 (split v0)** | **5.68** | **5.95** | **12.4×** | 3 blocks/SM = 75% occupancy, steady |
+| + split BLAKE3 → GEMM-only (split v3, S=256) | 5.68 | 5.95 | 12.4× | still 2 blocks/SM (shared-mem bound!) |
+| + decouple staging width S=128 (split v1) | 6.92 | 7.25 | 15.1× | 4 blocks/SM = **100% occupancy** |
+| **+ per-warp transcript in shared (split v1)** | **7.15** | **7.5** | **15.6×** | frees regs, trims MINB4 spill |
 
-Current best: **`pearl_pow_split` variant 0 (GEMM-only 4×4 MINB3 + BLAKE3 pass)** — the miner uses it.
-At ~5.68 Mtiles/s we are at ~28% of dp4a peak; still occupancy/latency-limited.
+Current best: **`pearl_pow_split` variant 1 (GEMM-only S=128 4×4 MINB4 + BLAKE3 pass)** — the miner uses it.
+At ~7.15 Mtiles/s we are at ~36% of dp4a peak.
+
+### The shared-memory occupancy unlock (the big one)
+The split GEMM-only kernel reported MINB3, but at full staging width S=R=256 it stages
+`sAi`+`sBi` = 64×65×4 ×2 ≈ **33 KB/block** → `floor(96/33) = 2` blocks/SM. So it was
+**shared-memory-bound at 2 blocks**, and the MINB3 register cap did nothing. Decoupling
+the staging width **S** from the R=256 reduction window (stage S=128 columns, keep
+accumulating `acc`, XOR-reduce only at R boundaries — bit-exact) halves the shared
+footprint to ~17 KB → 4 blocks/SM = **100% thread occupancy**. That single change is
++21%. Moving the per-warp transcript into shared (the 31 non-zero lanes were carrying
+it dead in registers) trims the residual MINB4 spill for another ~+3%.
 
 > **Measurement note.** All numbers above are at the *real* mining config (k=4096).
 > An earlier split benchmark at k=16384 (4× the real k) overstated the split win at

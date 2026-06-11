@@ -43,7 +43,12 @@ static constexpr int HASH_ROT_GO = 13;
 static constexpr int TRANSCRIPT_U32_GO = 16;
 static constexpr int ELT_PER_LANE_GO = (HT_GO * HT_GO) / 32;  // 8
 
-template <int R, int WM, int WN, int MINB>
+// S = shared-memory staging width (a divisor of R). The transcript still samples
+// the running accumulator at every R-column boundary (bit-exact), but operands
+// are staged S columns at a time, so the shared footprint scales with S, not R.
+// At R=256 a full-width stage is ~33 KB/block -> only 2 blocks/SM (shared-mem
+// limited, NOT register limited). S=128 halves that to ~17 KB -> 3-4 blocks/SM.
+template <int R, int S, int WM, int WN, int MINB>
 __global__ void __launch_bounds__(WM* WN * 32, MINB) pearl_gemm_only_kernel(
     const int8_t* __restrict__ A,     // [m, k] noised
     const int8_t* __restrict__ Bt,    // [n, k] noised (B transposed)
@@ -53,11 +58,11 @@ __global__ void __launch_bounds__(WM* WN * 32, MINB) pearl_gemm_only_kernel(
 {
   constexpr int ROWS_A = HT_GO * WM;
   constexpr int ROWS_B = HT_GO * WN;
-  constexpr int RW = R / 4;
-  // Conflict-free odd stride (coprime to 32). Matches the fused kernel; the
-  // int4-aligned stride (RW+4)&~3 == 68 has 68%32==4, reintroducing bank
-  // conflicts that net-regress at the real k=4096 config.
-  constexpr int SAW = RW + 1;
+  constexpr int SW = S / 4;          // dp4a words per staged sub-chunk
+  constexpr int SUB = R / S;         // sub-chunks per R-wide reduction window
+  static_assert(R % S == 0, "S must divide R");
+  // Conflict-free odd stride (coprime to 32).
+  constexpr int SAW = SW + 1;
 
   const int tiles_w = n / HT_GO;
   const int blocks_n = tiles_w / WN;
@@ -77,51 +82,64 @@ __global__ void __launch_bounds__(WM* WN * 32, MINB) pearl_gemm_only_kernel(
   int acc[ELT_PER_LANE_GO];
 #pragma unroll
   for (int e = 0; e < ELT_PER_LANE_GO; ++e) acc[e] = 0;
-  uint32_t transcript[TRANSCRIPT_U32_GO];
-#pragma unroll
-  for (int e = 0; e < TRANSCRIPT_U32_GO; ++e) transcript[e] = 0u;
 
   __shared__ int sAi[ROWS_A * SAW];
   __shared__ int sBi[ROWS_B * SAW];
+  // Per-warp transcript in shared memory. Only lane 0 of each warp touches its
+  // row, so keeping the 16-word transcript here (instead of a per-thread
+  // register array the other 31 lanes carry dead) frees ~16 regs/thread —
+  // enough to run MINB4 (100% occupancy) without register spills.
+  __shared__ uint32_t sT[WM * WN][TRANSCRIPT_U32_GO];
+  if (lane == 0) {
+#pragma unroll
+    for (int e = 0; e < TRANSCRIPT_U32_GO; ++e) sT[warp][e] = 0u;
+  }
   const int* Ai = reinterpret_cast<const int*>(A);
   const int* Bi = reinterpret_cast<const int*>(Bt);
 
-  const int T = k / R;
-  for (int t = 0; t < T; ++t) {
-    const int koff4 = (t * R) / 4;
-    __syncthreads();
-    for (int i = tid; i < ROWS_A * RW; i += blockDim.x) {
-      const int r = i / RW, c4 = i % RW;
-      sAi[r * SAW + c4] = Ai[(size_t)(row_base + r) * (k / 4) + koff4 + c4];
-    }
-    for (int i = tid; i < ROWS_B * RW; i += blockDim.x) {
-      const int r = i / RW, c4 = i % RW;
-      sBi[r * SAW + c4] = Bi[(size_t)(col_base + r) * (k / 4) + koff4 + c4];
-    }
-    __syncthreads();
+  // Per-thread micro-tile shared pointers (constant across all chunks).
+  constexpr int RM = 4, RN = 2;
+  const int mtr = lane >> 3;
+  const int mtc = lane & 7;
+  const int* ar[RM];
+  const int* br[RN];
+#pragma unroll
+  for (int i = 0; i < RM; ++i) ar[i] = &sAi[(aRow0 + mtr * RM + i) * SAW];
+#pragma unroll
+  for (int j = 0; j < RN; ++j) br[j] = &sBi[(bRow0 + mtc * RN + j) * SAW];
 
-    constexpr int RM = 4, RN = 2;
-    const int mtr = lane >> 3;
-    const int mtc = lane & 7;
-    const int* ar[RM];
-    const int* br[RN];
+  const int T = k / R;
+  int ts = 0;  // global sub-chunk index
+  for (int t = 0; t < T; ++t) {
 #pragma unroll
-    for (int i = 0; i < RM; ++i) ar[i] = &sAi[(aRow0 + mtr * RM + i) * SAW];
+    for (int sub = 0; sub < SUB; ++sub, ++ts) {
+      const int koff4 = ts * SW;
+      __syncthreads();
+      for (int i = tid; i < ROWS_A * SW; i += blockDim.x) {
+        const int r = i / SW, c4 = i % SW;
+        sAi[r * SAW + c4] = Ai[(size_t)(row_base + r) * (k / 4) + koff4 + c4];
+      }
+      for (int i = tid; i < ROWS_B * SW; i += blockDim.x) {
+        const int r = i / SW, c4 = i % SW;
+        sBi[r * SAW + c4] = Bi[(size_t)(col_base + r) * (k / 4) + koff4 + c4];
+      }
+      __syncthreads();
+
 #pragma unroll
-    for (int j = 0; j < RN; ++j) br[j] = &sBi[(bRow0 + mtc * RN + j) * SAW];
+      for (int kk = 0; kk < SW; ++kk) {
+        int a[RM], b[RN];
 #pragma unroll
-    for (int kk = 0; kk < RW; ++kk) {
-      int a[RM], b[RN];
+        for (int i = 0; i < RM; ++i) a[i] = ar[i][kk];
 #pragma unroll
-      for (int i = 0; i < RM; ++i) a[i] = ar[i][kk];
+        for (int j = 0; j < RN; ++j) b[j] = br[j][kk];
 #pragma unroll
-      for (int j = 0; j < RN; ++j) b[j] = br[j][kk];
+        for (int i = 0; i < RM; ++i)
 #pragma unroll
-      for (int i = 0; i < RM; ++i)
-#pragma unroll
-        for (int j = 0; j < RN; ++j)
-          acc[i * RN + j] = dp4a_go(a[i], b[j], acc[i * RN + j]);
+          for (int j = 0; j < RN; ++j)
+            acc[i * RN + j] = dp4a_go(a[i], b[j], acc[i * RN + j]);
+      }
     }
+    // R-wide reduction window complete: sample the running accumulator.
     uint32_t lx = 0u;
 #pragma unroll
     for (int e = 0; e < ELT_PER_LANE_GO; ++e) lx ^= (uint32_t)acc[e];
@@ -130,7 +148,7 @@ __global__ void __launch_bounds__(WM* WN * 32, MINB) pearl_gemm_only_kernel(
       lx ^= __shfl_xor_sync(0xffffffffu, lx, off);
     if (lane == 0) {
       const int idx = t % TRANSCRIPT_U32_GO;
-      transcript[idx] = rotl32_go(transcript[idx], HASH_ROT_GO) ^ lx;
+      sT[warp][idx] = rotl32_go(sT[warp][idx], HASH_ROT_GO) ^ lx;
     }
   }
 
@@ -141,46 +159,54 @@ __global__ void __launch_bounds__(WM* WN * 32, MINB) pearl_gemm_only_kernel(
   const int tile_id = (gi / HT_GO) * tiles_w + (gj / HT_GO);
   uint32_t* tb = &transcript_buffer[(size_t)tile_id * TRANSCRIPT_U32_GO];
 #pragma unroll
-  for (int i = 0; i < TRANSCRIPT_U32_GO; ++i) tb[i] = transcript[i];
+  for (int i = 0; i < TRANSCRIPT_U32_GO; ++i) tb[i] = sT[warp][i];
 }
 
-template <int R, int WM, int WN, int MINB>
+template <int R, int S, int WM, int WN, int MINB>
 static void launch_go_cfg(const int8_t* A, const int8_t* Bt, int m, int n, int k,
                           uint32_t* transcript_buffer, cudaStream_t stream) {
   const int num_block_tiles = (m / (HT_GO * WM)) * (n / (HT_GO * WN));
   dim3 grid(num_block_tiles);
   dim3 block(WM * WN * 32);
-  pearl_gemm_only_kernel<R, WM, WN, MINB><<<grid, block, 0, stream>>>(
+  pearl_gemm_only_kernel<R, S, WM, WN, MINB><<<grid, block, 0, stream>>>(
       A, Bt, n, k, transcript_buffer);
 }
 
-// Variant dispatch for the GEMM-only kernel.
-//   v=0 -> 4×4 MINB3  (75 % occupancy, recommended for gemm-only)
-//   v=1 -> 4×4 MINB2  (50 %)
-//   v=2 -> 4×4 MINB1  (25 %)
-//   v=3 -> 2×2 MINB4  (100 % occupancy, less reuse)
-//   v=4 -> 2×4 MINB3
+// Variant dispatch for the GEMM-only kernel. S = staging width (divides R); the
+// shared footprint scales with S, so a narrower S unlocks higher occupancy at
+// R=256 (which is shared-mem-bound at full S=256: ~33 KB -> 2 blocks/SM).
+//   v=0 -> S=128 4×4 MINB3   (half shared mem -> aim 3 blocks/SM)
+//   v=1 -> S=128 4×4 MINB4   (push 4 blocks/SM if registers allow)
+//   v=2 -> S=64  4×4 MINB4   (quarter shared mem)
+//   v=3 -> S=256 4×4 MINB3   (full-width baseline = old best)
+//   v=4 -> S=128 4×4 MINB2
+//   v=5 -> S=64  4×4 MINB3
+//   v=6 -> S=128 2×4 MINB4
 void launch_pearl_gemm_only(
     const int8_t* A, const int8_t* Bt, int m, int n, int k, int R,
     uint32_t* transcript_buffer, int variant, cudaStream_t stream) {
   if (R == 256) {
     switch (variant) {
       case 0:
-        launch_go_cfg<256, 4, 4, 3>(A, Bt, m, n, k, transcript_buffer, stream); break;
+        launch_go_cfg<256, 128, 4, 4, 3>(A, Bt, m, n, k, transcript_buffer, stream); break;
       case 1:
-        launch_go_cfg<256, 4, 4, 2>(A, Bt, m, n, k, transcript_buffer, stream); break;
+        launch_go_cfg<256, 128, 4, 4, 4>(A, Bt, m, n, k, transcript_buffer, stream); break;
       case 2:
-        launch_go_cfg<256, 4, 4, 1>(A, Bt, m, n, k, transcript_buffer, stream); break;
+        launch_go_cfg<256, 64, 4, 4, 4>(A, Bt, m, n, k, transcript_buffer, stream); break;
       case 3:
-        launch_go_cfg<256, 2, 2, 4>(A, Bt, m, n, k, transcript_buffer, stream); break;
+        launch_go_cfg<256, 256, 4, 4, 3>(A, Bt, m, n, k, transcript_buffer, stream); break;
       case 4:
-        launch_go_cfg<256, 2, 4, 3>(A, Bt, m, n, k, transcript_buffer, stream); break;
+        launch_go_cfg<256, 128, 4, 4, 2>(A, Bt, m, n, k, transcript_buffer, stream); break;
+      case 5:
+        launch_go_cfg<256, 64, 4, 4, 3>(A, Bt, m, n, k, transcript_buffer, stream); break;
+      case 6:
+        launch_go_cfg<256, 128, 2, 4, 4>(A, Bt, m, n, k, transcript_buffer, stream); break;
       default:
-        launch_go_cfg<256, 4, 4, 3>(A, Bt, m, n, k, transcript_buffer, stream); break;
+        launch_go_cfg<256, 128, 4, 4, 3>(A, Bt, m, n, k, transcript_buffer, stream); break;
     }
   } else if (R == 128) {
-    launch_go_cfg<128, 4, 4, 3>(A, Bt, m, n, k, transcript_buffer, stream);
+    launch_go_cfg<128, 128, 4, 4, 3>(A, Bt, m, n, k, transcript_buffer, stream);
   } else if (R == 64) {
-    launch_go_cfg<64, 4, 4, 3>(A, Bt, m, n, k, transcript_buffer, stream);
+    launch_go_cfg<64, 64, 4, 4, 3>(A, Bt, m, n, k, transcript_buffer, stream);
   }
 }
