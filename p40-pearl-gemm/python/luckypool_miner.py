@@ -179,19 +179,18 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions, dev, lo
     a_seed, b_seed = miner.commitment_hashes(A, B, key)                # commits A and B^T
     log(f"  committed A,B ({(time.time()-t0):.1f}s)")
 
-    # full sparse permutation noise (small: R x K and K x R) — matches generate_noise
-    E_AR = miner._perm_matrix(SEED_A, a_seed, R, K, R, assign_cols=True).to(dev)   # [R,K]
-    E_BL = miner._perm_matrix(SEED_B, b_seed, K, R, R, assign_cols=False).to(dev)  # [K,R]
-    E_BLt = E_BL.t().contiguous()                                                  # [R,K]
+    # GPU noise generation (all on-device; replaces the Python BLAKE3 path).
+    # EAL[M,R], EAR[R,K], EBL[K,R], EBR[N,R] — bit-exact with generate_noise.
+    key_t = torch.frombuffer(bytearray(a_seed), dtype=torch.uint8).to(dev)
+    keyB_t = torch.frombuffer(bytearray(b_seed), dtype=torch.uint8).to(dev)
+    EAL, EAR, EBL, EBR = miner._C.noise_gen(key_t, keyB_t, M, N, K, R)
+    E_BLt = EBL.t().contiguous()                                                  # [R,K]
 
     RS = region
-    key_t = torch.frombuffer(bytearray(a_seed), dtype=torch.uint8).to(dev)
     tgt_t = torch.frombuffer(bytearray(int(bound).to_bytes(32, "little")), dtype=torch.uint8).to(dev)
     searched = 0
     for r0 in range(0, M, RS):
-        # windowed dense noise for these output rows (only RS rows, not all M)
-        E_AL = _uniform_rows(SEED_A, a_seed, r0, RS).to(dev)             # [RS,R] = E_AL[r0:r0+RS]
-        A_ns = (A[r0:r0+RS].int() + _imatmul_i8(E_AL, E_AR).int()).to(torch.int8)
+        A_ns = (A[r0:r0+RS].int() + _imatmul_i8(EAL[r0:r0+RS], EAR).int()).to(torch.int8)
         for c0 in range(0, N, RS):
             if max_regions and searched >= max_regions:
                 log(f"  searched {searched} regions, no hit; next job"); return None
@@ -200,10 +199,8 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions, dev, lo
                 log(f"  job superseded after {searched} regions; abandoning for fresh job")
                 return ("NEWJOB", newer)
             searched += 1
-            # windowed B^T noise for these output cols
-            E_BRt = _uniform_rows(SEED_B, b_seed, c0, RS).to(dev)        # [RS,R] = E_BR[:,cols]^T
             Bt_cols = B[:, c0:c0+RS].t().contiguous()                    # [RS,K] = B^T[cols]
-            Bt_ns = (Bt_cols.int() + _imatmul_i8(E_BRt, E_BLt).int()).to(torch.int8)
+            Bt_ns = (Bt_cols.int() + _imatmul_i8(EBR[c0:c0+RS], E_BLt).int()).to(torch.int8)
 
             # fused kernel (warp-per-tile, ~5x the naive pearl_pow); bit-exact transcript
             _, found, coord = miner._C.pearl_pow_fused(A_ns.contiguous(), Bt_ns.contiguous(), key_t, tgt_t, R, 0)

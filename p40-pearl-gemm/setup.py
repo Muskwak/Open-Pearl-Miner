@@ -19,10 +19,10 @@ COMPUTE_CAP = f"arch=compute_{cc},code={TARGET_ARCH}"
 # Additional architectures to enable broad compatibility
 # Pascal: sm_61 (P40, GTX 1080), sm_60 (P100)
 # Volta+: sm_70, sm_75, sm_80, sm_86, sm_89 (for fallback testing on newer GPUs)
-ADDITIONAL_ARCHS = os.environ.get(
-    "ADDITIONAL_ARCHS",
-    "sm_70,sm_75,sm_80,sm_86"
-)
+# Default to the target arch only (Pascal sm_61). Building the extra Volta+
+# arches multiplies nvcc compile time ~5x; set ADDITIONAL_ARCHS explicitly to
+# re-enable them for broad-compat builds.
+ADDITIONAL_ARCHS = os.environ.get("ADDITIONAL_ARCHS", "")
 
 _GENCODE_FLAGS = []
 for a in [TARGET_ARCH] + [a.strip() for a in ADDITIONAL_ARCHS.split(",") if a.strip()]:

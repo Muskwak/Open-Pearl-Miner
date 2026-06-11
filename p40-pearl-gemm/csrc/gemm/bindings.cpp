@@ -22,6 +22,12 @@ void launch_noise_A(
     const int8_t* A, const int8_t* EAL, const int8_t* EAR, const int8_t* EBL,
     int8_t* ApEA, int32_t* AxEBL, int M, int K, int R, cudaStream_t stream);
 
+// GPU noise generator (definition in noise_generation.cu)
+void launch_noise_gen(
+    int8_t* EAL, int8_t* EAR_R_major, int8_t* EBL_K_major, int8_t* EBR,
+    const uint8_t* key_A, const uint8_t* key_B,
+    int m, int n, int k, int R, cudaStream_t stream);
+
 void launch_noise_B(
     const int8_t* B, const int8_t* EBR, const int8_t* EAR, const int8_t* EBL,
     int8_t* BpEB, int32_t* EARxBpEB, int N, int K, int R, cudaStream_t stream);
@@ -247,10 +253,40 @@ std::vector<at::Tensor> pearl_pow_fused(at::Tensor A, at::Tensor Bt,
   return {digests, found, coord};
 }
 
+// Generate the Pearl noise tensors on the GPU from the commitment keys.
+// Returns {EAL[m,R], EAR[R,k], EBL[k,R], EBR[n,R]} int8 (matches Python
+// generate_noise: EAL/EBR uniform, EAR/EBL sparse-perm; seeds "A_tensor"/"B_tensor").
+std::vector<at::Tensor> noise_gen(at::Tensor key_A, at::Tensor key_B,
+                                  int64_t m, int64_t n, int64_t k, int64_t R) {
+  TORCH_CHECK(key_A.is_cuda() && key_B.is_cuda(), "noise_gen: keys must be CUDA");
+  TORCH_CHECK(key_A.scalar_type() == at::kByte && key_B.scalar_type() == at::kByte,
+              "noise_gen: keys must be uint8");
+  TORCH_CHECK(key_A.numel() == 32 && key_B.numel() == 32,
+              "noise_gen: keys must be 32 bytes");
+  const c10::cuda::CUDAGuard device_guard(key_A.device());
+  auto i8 = at::TensorOptions().dtype(at::kChar).device(key_A.device());
+  auto EAL = at::empty({m, R}, i8);
+  auto EAR = at::empty({R, k}, i8);
+  auto EBL = at::empty({k, R}, i8);
+  auto EBR = at::empty({n, R}, i8);
+  launch_noise_gen(
+      EAL.data_ptr<int8_t>(), EAR.data_ptr<int8_t>(), EBL.data_ptr<int8_t>(),
+      EBR.data_ptr<int8_t>(),
+      reinterpret_cast<const uint8_t*>(key_A.data_ptr()),
+      reinterpret_cast<const uint8_t*>(key_B.data_ptr()),
+      (int)m, (int)n, (int)k, (int)R, cur_stream());
+  return {EAL, EAR, EBL, EBR};
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "Pascal (sm_61) Pearl GEMM CUDA kernels";
   m.def("dp4a_gemm", &dp4a_gemm, "INT8 DP4A GEMM (C = A @ B^T, dequantized)");
   m.def("noise_A", &noise_A, "Pearl noise A kernel");
+  m.def("noise_gen", &noise_gen,
+        "Generate Pearl noise EAL/EAR/EBL/EBR on GPU from commitment keys",
+        pybind11::arg("key_A"), pybind11::arg("key_B"),
+        pybind11::arg("m"), pybind11::arg("n"), pybind11::arg("k"),
+        pybind11::arg("R"));
   m.def("noise_B", &noise_B, "Pearl noise B kernel");
   m.def("denoise_converter", &denoise_converter,
         "int32 -> fp16 denoise conversion");
