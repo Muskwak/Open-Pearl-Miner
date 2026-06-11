@@ -202,8 +202,8 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions, dev, lo
             Bt_cols = B[:, c0:c0+RS].t().contiguous()                    # [RS,K] = B^T[cols]
             Bt_ns = (Bt_cols.int() + _imatmul_i8(EBR[c0:c0+RS], E_BLt).int()).to(torch.int8)
 
-            # fused kernel (warp-per-tile, ~5x the naive pearl_pow); bit-exact transcript
-            _, found, coord = miner._C.pearl_pow_fused(A_ns.contiguous(), Bt_ns.contiguous(), key_t, tgt_t, R, 0)
+            # fused kernel variant 1 (4x4 MINB2): ~5.9 TH/s on P40, bit-exact transcript
+            _, found, coord = miner._C.pearl_pow_fused(A_ns.contiguous(), Bt_ns.contiguous(), key_t, tgt_t, R, 1)
             torch.cuda.synchronize()
             if int(found[0]) != 1:
                 continue

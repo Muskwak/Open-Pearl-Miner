@@ -215,6 +215,12 @@ void launch_pearl_pow_fused_v(
       launch_cfg<256, 2, 2, 4>(A, Bt, m, n, k, pow_key, pow_target, out_digests, found_flag, found_coord, stream); break;
     case 3:
       launch_cfg<256, 2, 4, 3>(A, Bt, m, n, k, pow_key, pow_target, out_digests, found_flag, found_coord, stream); break;
+    case 4:
+      launch_cfg<256, 4, 4, 3>(A, Bt, m, n, k, pow_key, pow_target, out_digests, found_flag, found_coord, stream); break;
+    case 5:
+      launch_cfg<256, 4, 4, 4>(A, Bt, m, n, k, pow_key, pow_target, out_digests, found_flag, found_coord, stream); break;
+    case 6:
+      launch_cfg<256, 2, 4, 4>(A, Bt, m, n, k, pow_key, pow_target, out_digests, found_flag, found_coord, stream); break;
     default:
       launch_cfg<256, 4, 4, 1>(A, Bt, m, n, k, pow_key, pow_target, out_digests, found_flag, found_coord, stream); break;
   }
