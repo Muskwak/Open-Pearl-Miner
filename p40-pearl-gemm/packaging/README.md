@@ -21,16 +21,27 @@ p40-miner.exe --wallet prl1THEIRWALLET --worker rig1
 
 ## Linux (binary)
 
-PyInstaller **does not cross-compile**, and the CUDA extension + torch are
-platform-specific, so the Linux binary must be built **on Linux** (native box or
-WSL2) with the CUDA toolkit and a matching CUDA PyTorch installed:
+PyInstaller **does not cross-compile**, so the Linux binary must be built **on a
+Linux machine with an NVIDIA (Pascal) GPU**. The torch-free build only needs the
+CUDA toolkit (nvcc) + a few small Python packages — NOT PyTorch.
 
 ```bash
-export CUTLASS_DIR=/path/to/cutlass/include   # only needed if the .so isn't built yet
+# 1. Prerequisites (Ubuntu/Debian example):
+sudo apt-get install -y nvidia-cuda-toolkit            # provides nvcc + cudart
+pip install numpy blake3 py-pearl-mining pyinstaller   # small pure deps + Rust proof builder
+
+# 2. CUTLASS headers (header-only; clone once):
+git clone --depth 1 https://github.com/NVIDIA/cutlass
+export CUTLASS_DIR=$PWD/cutlass/include
+
+# 3. Build (from p40-pearl-gemm/):
 bash packaging/build_linux.sh
 ```
 
-Output: `dist/p40-miner/` → users run `./p40-miner --wallet prl1... --worker rig1`.
+This compiles `libp40cuda.so` (`packaging/build_capi.sh`) then freezes the miner
+into `dist/p40-miner/`. Users run `./p40-miner --wallet prl1... --worker rig1`
+(needs only an NVIDIA driver). If `nvcc` isn't found, install the matching CUDA
+toolkit from NVIDIA and ensure `nvcc` and `cudart` are on PATH.
 
 ## Notes
 
