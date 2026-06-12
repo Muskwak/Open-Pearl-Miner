@@ -33,7 +33,7 @@ run_luckypool.bat --wallet prl1YOURWALLET --worker p40
 
 ## Standalone binary (no Python/torch needed)
 
-A self-contained **~60 MB** binary (torch-free) is built with:
+A self-contained **~74 MB** binary (torch-free, ~6.9 TH/s sustained) is built with:
 
 ```
 packaging\build_windows.bat       # Windows -> dist\p40-miner\
