@@ -34,15 +34,14 @@ class Bufs:
         self.dEAR = cc.DBuf(R * K)
         self.dEBL = cc.DBuf(K * R)
         self.dEBR = cc.DBuf(N * R)
-        self.dEAR_t = cc.DBuf(K * R)
-        self.dEBL_t = cc.DBuf(R * K)
-        self.dka = cc.DBuf(32)
-        self.dkb = cc.DBuf(32)
+        self.dEAR_t = cc.DBuf(K * R)     # EAR^T = Y for the noise_A gemm
+        self.dBt_full = cc.DBuf(N * K)   # B^T for the GPU commitment
+        self.dkeyjob = cc.DBuf(32)       # job key (keys the commitment + proof)
+        self.dnsA = cc.DBuf(32)          # noise_seed_A (== commitment_A, the pow_key)
+        self.dnsB = cc.DBuf(32)          # noise_seed_B
         self.dtgt = cc.DBuf(32)
         self.dApEA = cc.DBuf(RS * K)
-        self.dAxEBL = cc.DBuf(RS * R * 4)
         self.dBt_tmp = cc.DBuf(RS * K)
-        self.dEARx = cc.DBuf(RS * R * 4)
         ntiles = (RS // 16) ** 2
         self.dtb = cc.DBuf(ntiles * 16 * 4)   # reusable transcript buffer
         self.dfound = cc.DBuf(4)
@@ -50,10 +49,6 @@ class Bufs:
         # Persistent per-column Bt_ns buffers (one per column block), reused every
         # job — recomputed per job but never re-malloc'd.
         self.dBpEB = [cc.DBuf(RS * K) for _ in range(N // RS)]
-
-
-def _rand_i8(rows, cols):
-    return np.random.randint(-64, 63, size=(rows, cols), dtype=np.int8)
 
 
 def mine_job(pool, cfg, header, target_int, job_id, region, max_regions, sched, bufs, log):
@@ -65,15 +60,12 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions, sched, 
     key = pearl_host.derive_key(header, cfg)
 
     t0 = time.time()
-    A = _rand_i8(M, K)
-    B = _rand_i8(K, N)
-    a_seed, b_seed = pearl_host.commitment_hashes(A, B, key)
-    bufs.dA.from_host(A); bufs.dB.from_host(B)
-    bufs.dka.from_host(np.frombuffer(a_seed, np.uint8).copy())
-    bufs.dkb.from_host(np.frombuffer(b_seed, np.uint8).copy())
-    cc.noise_gen(bufs.dEAL, bufs.dEAR, bufs.dEBL, bufs.dEBR, bufs.dka, bufs.dkb, M, N, K, R)
-    cc.transpose_i8(bufs.dEAR, bufs.dEAR_t, R, K, K, 0)   # [R,K]->[K,R]
-    cc.transpose_i8(bufs.dEBL, bufs.dEBL_t, K, R, R, 0)   # [K,R]->[R,K]
+    # All-GPU setup: fill A,B (Philox) + keyed commitment -> noise seeds, ~0.1s.
+    bufs.dkeyjob.from_host(np.frombuffer(key, np.uint8).copy())
+    cc.setup_job(bufs.dA, bufs.dB, bufs.dBt_full, bufs.dkeyjob, bufs.dnsA, bufs.dnsB,
+                 M, N, K, R, time.time_ns() & 0xFFFFFFFFFFFFFFFF)
+    cc.noise_gen(bufs.dEAL, bufs.dEAR, bufs.dEBL, bufs.dEBR, bufs.dnsA, bufs.dnsB, M, N, K, R)
+    cc.transpose_i8(bufs.dEAR, bufs.dEAR_t, R, K, K, 0)   # [R,K]->[K,R] (Y for noise_A)
     bufs.dtgt.from_host(np.frombuffer(int(bound).to_bytes(32, "little"), np.uint8).copy())
     cc.sync()
     log(f"  committed A,B + noise ({time.time()-t0:.1f}s)")
@@ -92,15 +84,16 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions, sched, 
         d = bufs.dBpEB[idx]
         if idx not in computed:
             cc.transpose_i8(bufs.dB, bufs.dBt_tmp, K, RS, N, c0)  # B[:,c0:c0+RS].t()
-            cc.noise_apply_B(bufs.dBt_tmp, bufs.dEBR.offset(c0 * R), bufs.dEAR,
-                             bufs.dEBL, d, bufs.dEARx, RS, K, R)
+            # Bt_ns = clamp(Bt + EBR @ EBL^T over R)
+            cc.noise_gemm(bufs.dEBR.offset(c0 * R), bufs.dEBL, bufs.dBt_tmp, d, RS, K, R)
             computed.add(idx)
         return d
 
     if True:
         for r0 in range(0, M, RS):
-            cc.noise_apply_A(bufs.dA.offset(r0 * K), bufs.dEAL.offset(r0 * R),
-                             bufs.dEAR_t, bufs.dEBL_t, bufs.dApEA, bufs.dAxEBL, RS, K, R)
+            # A_ns = clamp(A + EAL @ EAR_t^T over R)
+            cc.noise_gemm(bufs.dEAL.offset(r0 * R), bufs.dEAR_t, bufs.dA.offset(r0 * K),
+                          bufs.dApEA, RS, K, R)
             for c0 in range(0, N, RS):
                 if max_regions and searched >= max_regions:
                     ths = searched * tiles_per_region / max(time.time() - search_t0, 1e-9) / 1e6
@@ -120,7 +113,8 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions, sched, 
                 bufs.dfound.memset(0)
                 # digests=None: mining only needs found/coord (skips the per-tile
                 # digest write); transcript is the reusable buffer (no per-region malloc).
-                cc.pearl_pow_split(bufs.dApEA, dBpEB, RS, RS, K, R, bufs.dka, bufs.dtgt,
+                # pow_key MUST be noise_seed_A (dnsA), not the job key.
+                cc.pearl_pow_split(bufs.dApEA, dBpEB, RS, RS, K, R, bufs.dnsA, bufs.dtgt,
                                    bufs.dtb, None, bufs.dfound, bufs.dcoord, VARIANT)
                 cc.sync()
                 bufs.dfound.to_host(found)
@@ -132,6 +126,9 @@ def mine_job(pool, cfg, header, target_int, job_id, region, max_regions, sched, 
                 ths = searched * tiles_per_region / max(time.time() - search_t0, 1e-9) / 1e6
                 log(f"  HIT tile (row={gr}, col={gc}) after {searched} regions "
                     f"({ths:.2f} TH/s); building proof...")
+                # A,B live on the GPU; copy them to host only on a hit (rare).
+                A = np.empty((M, K), np.int8); bufs.dA.to_host(A)
+                B = np.empty((K, N), np.int8); bufs.dB.to_host(B)
                 proof = pearl_host.build_proof(A, B, gr, gc, key, R)
                 try:
                     v, vmsg = pearl_host.verify_proof_local(header, proof)

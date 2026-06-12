@@ -11,6 +11,12 @@
 #include <cstdint>
 #include <cstddef>
 
+#include "tensor_hash/tensor_hash_decl.hpp"  // tensor_hash, commitment_hash_from_merkle_roots
+
+// GPU job setup kernels (rng_fill_sm61.cu).
+extern "C" void launch_fill_rand_i8(int8_t* out, int64_t numel, uint64_t seed, cudaStream_t stream);
+extern "C" void launch_transpose_i8(const int8_t* src, int8_t* dst, int rows, int cols, cudaStream_t stream);
+
 #ifdef _WIN32
 #define P40_API extern "C" __declspec(dllexport)
 #else
@@ -24,6 +30,8 @@ void launch_noise_A(const int8_t*, const int8_t*, const int8_t*, const int8_t*,
                     int8_t*, int32_t*, int, int, int, cudaStream_t);
 void launch_noise_B(const int8_t*, const int8_t*, const int8_t*, const int8_t*,
                     int8_t*, int32_t*, int, int, int, cudaStream_t);
+void launch_noise_gemm(const int8_t* X, const int8_t* Y, const int8_t* Z,
+                       int8_t* out, int M, int K, int R, cudaStream_t);
 void launch_pearl_gemm_only(const int8_t*, const int8_t*, int, int, int, int,
                             uint32_t*, int, cudaStream_t);
 void launch_pearl_blake3(const uint32_t*, int, int, const uint32_t*,
@@ -73,6 +81,43 @@ P40_API int p40_transpose_i8(const void* src, void* dst, int rows, int cols,
 
 // =========================== kernels =======================================
 
+// GPU job setup (mirrors the torch setup_job): Philox-fill A[M,K] and B[K,N],
+// transpose B->Bt[N,K], tensor_hash A and Bt (keyed by `key`), then derive the
+// noise seeds. A, B, Bt, key, nsA, nsB are caller-allocated device buffers
+// (nsA/nsB are 32 bytes). Replaces the ~7s host RNG+commit with ~0.1s on-device.
+P40_API int p40_setup_job(void* A, void* B, void* Bt, const void* key,
+                          void* nsA, void* nsB, int M, int N, int K, int R,
+                          unsigned long long seed) {
+  cudaStream_t s = 0;
+  launch_fill_rand_i8((int8_t*)A, (int64_t)M * K, seed, s);
+  launch_fill_rand_i8((int8_t*)B, (int64_t)K * N, seed + 1, s);
+  launch_transpose_i8((const int8_t*)B, (int8_t*)Bt, K, N, s);  // B[K,N] -> Bt[N,K]
+
+  const unsigned chunk = 1024u, tpb = 128u;
+  unsigned ncA = ((unsigned)((int64_t)M * K) + chunk - 1) / chunk, nbA = (ncA + tpb - 1) / tpb;
+  unsigned ncB = ((unsigned)((int64_t)N * K) + chunk - 1) / chunk, nbB = (ncB + tpb - 1) / tpb;
+  unsigned scratch_bytes = (nbA > nbB ? nbA : nbB) * 32u;
+  uint8_t *A_root = nullptr, *B_root = nullptr, *scratch = nullptr;
+  cudaMalloc((void**)&A_root, 32);
+  cudaMalloc((void**)&B_root, 32);
+  cudaMalloc((void**)&scratch, scratch_bytes);
+  int dev = 0;
+  cudaGetDevice(&dev);
+  cudaDeviceProp prop;
+  cudaGetDeviceProperties(&prop, dev);
+  tensor_hash((const uint8_t*)A, (uint32_t)((int64_t)M * K), A_root,
+              (const uint8_t*)key, nbA, tpb, 2, 512, scratch, prop, s);
+  tensor_hash((const uint8_t*)Bt, (uint32_t)((int64_t)N * K), B_root,
+              (const uint8_t*)key, nbB, tpb, 2, 512, scratch, prop, s);
+  commitment_hash_from_merkle_roots(A_root, B_root, (const uint8_t*)key,
+                                    (uint8_t*)nsA, (uint8_t*)nsB, prop, s);
+  cudaError_t e = cudaGetLastError();
+  cudaFree(A_root);
+  cudaFree(B_root);
+  cudaFree(scratch);
+  return (int)e;
+}
+
 // Generate the four noise operands. EAR is K-major [R,k], EBL is R-major [k,R]
 // (the corrected layout mapping, matching the torch noise_gen binding).
 P40_API int p40_noise_gen(void* EAL, void* EAR, void* EBL, void* EBR,
@@ -97,6 +142,15 @@ P40_API int p40_noise_apply_B(const void* B, const void* EBR, const void* EAR,
                               int N, int K, int R) {
   launch_noise_B((const int8_t*)B, (const int8_t*)EBR, (const int8_t*)EAR,
                  (const int8_t*)EBL, (int8_t*)BpEB, (int32_t*)EARxBpEB, N, K, R, 0);
+  return (int)cudaGetLastError();
+}
+
+// Fast noise-apply: out[M,K] = clamp(Z + X @ Y^T over R). For noise_A pass
+// X=EAL, Y=EAR_t, Z=A_slice; for noise_B pass X=EBR, Y=EBL, Z=Bt.
+P40_API int p40_noise_gemm(const void* X, const void* Y, const void* Z, void* out,
+                           int M, int K, int R) {
+  launch_noise_gemm((const int8_t*)X, (const int8_t*)Y, (const int8_t*)Z,
+                    (int8_t*)out, M, K, R, 0);
   return (int)cudaGetLastError();
 }
 

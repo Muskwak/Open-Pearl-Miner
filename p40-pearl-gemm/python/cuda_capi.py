@@ -52,7 +52,9 @@ _lib.p40_transpose_i8.argtypes = [_VP, _VP, _I, _I, _I, _I]
 _lib.p40_noise_gen.argtypes = [_VP, _VP, _VP, _VP, _VP, _VP, _I, _I, _I, _I]
 _lib.p40_noise_apply_A.argtypes = [_VP, _VP, _VP, _VP, _VP, _VP, _I, _I, _I]
 _lib.p40_noise_apply_B.argtypes = [_VP, _VP, _VP, _VP, _VP, _VP, _I, _I, _I]
+_lib.p40_noise_gemm.argtypes = [_VP, _VP, _VP, _VP, _I, _I, _I]
 _lib.p40_pearl_pow_split.argtypes = [_VP, _VP, _I, _I, _I, _I, _VP, _VP, _VP, _VP, _VP, _VP, _I]
+_lib.p40_setup_job.argtypes = [_VP, _VP, _VP, _VP, _VP, _VP, _I, _I, _I, _I, ctypes.c_ulonglong]
 
 
 def _chk(rc, what):
@@ -93,6 +95,17 @@ def sync():
 
 def transpose_i8(src, dst, rows, cols, src_ld, col_off):
     _chk(_lib.p40_transpose_i8(_as(src), _as(dst), rows, cols, src_ld, col_off), "transpose")
+
+
+def setup_job(A, B, Bt, key, nsA, nsB, M, N, K, R, seed):
+    """GPU job setup: fill A,B; commit; write noise seeds nsA,nsB (device)."""
+    _chk(_lib.p40_setup_job(_as(A), _as(B), _as(Bt), _as(key), _as(nsA), _as(nsB),
+                            M, N, K, R, seed), "setup_job")
+
+
+def noise_gemm(X, Y, Z, out, M, K, R):
+    """Fast noise-apply: out = clamp(Z + X @ Y^T over R)."""
+    _chk(_lib.p40_noise_gemm(_as(X), _as(Y), _as(Z), _as(out), M, K, R), "noise_gemm")
 
 
 def noise_gen(EAL, EAR, EBL, EBR, key_A, key_B, m, n, k, R):
