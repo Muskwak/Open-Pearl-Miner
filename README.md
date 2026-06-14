@@ -5,7 +5,7 @@ Tesla P40, GTX 1070 / 1080 (and other `sm_61`, DP4A-capable cards).
 
 No Python, CUDA toolkit, or PyTorch required **to run** — the CUDA runtime is bundled
 in pre-built releases. Just an NVIDIA driver and the standalone binary.
-**Source is open (MIT)** — build it yourself or grab a pre-built release.
+**Source is open** — build it yourself or grab a pre-built release. See [License](#license) for dev-fee terms.
 
 > Mixed-GPU rigs are supported: native code is compiled for Pascal/Turing/Ampere/Ada
 > (`sm_61/75/86/89`) plus a PTX fallback that JIT-loads on any newer NVIDIA card.
@@ -212,8 +212,8 @@ Every tip is appreciated and helps fund continued development.
 
 ## License
 
-**MIT License** — see [LICENSE](LICENSE).
+**Pascal Pearl Miner License** — see [LICENSE](LICENSE).
 
-Copyright (c) 2025 Muskwak / Pascal-Pearl-Miner. You must retain the copyright notice
-in all copies (attribution to this repository), but you are free to use, modify, and
-distribute the code for any purpose, including commercial use.
+- Free to use, modify, and distribute (including commercially), **provided the 2% dev fee is retained**.
+- Removal or bypass of the dev fee is a license violation in any distributed or commercial deployment.
+- **Personal-use exemption**: you may disable the dev fee for strictly personal, non-commercial mining on your own hardware — but the modified version must not be distributed.

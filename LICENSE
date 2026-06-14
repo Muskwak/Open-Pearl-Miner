@@ -1,4 +1,4 @@
-MIT License
+Pascal Pearl Miner License
 
 Copyright (c) 2025 Muskwak / Pascal-Pearl-Miner
 
@@ -9,8 +9,28 @@ to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 copies of the Software, and to permit persons to whom the Software is
 furnished to do so, subject to the following conditions:
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. The above copyright notice and this permission notice shall be included in
+   all copies or substantial portions of the Software.
+
+2. Dev Fee Retention. The Software includes a 2% developer fee that directs
+   mining work to the developer's address for 2% of cumulative mining time.
+   Any use, distribution, or commercial deployment of the Software (or any
+   derivative thereof) must retain this developer fee in its original form
+   and at its original rate. Removal, reduction, bypassing, or disabling of
+   the developer fee is a violation of this license, except as provided in
+   condition 3 below.
+
+3. Personal-Use Exemption. You may modify, remove, or disable the developer
+   fee for strictly personal, non-commercial use on your own equipment,
+   provided that the modified Software is not distributed, published, sold,
+   sublicensed, or deployed in any commercial or third-party context. Any
+   distribution — whether source or binary — must include the developer fee
+   intact.
+
+4. Self-Mining Exception. If you modify the Software to mine exclusively to
+   your own wallet address on your own hardware (with no commercial
+   arrangement, hosting service, or third-party deployment), you may disable
+   the developer fee under the Personal-Use Exemption above.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
