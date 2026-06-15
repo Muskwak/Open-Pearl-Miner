@@ -5,7 +5,7 @@ Tesla P40, GTX 1070 / 1080 (and other `sm_61`, DP4A-capable cards). (Experimenta
 
 No Python, CUDA toolkit, or PyTorch required **to run** — the CUDA runtime is bundled
 in pre-built releases. Just an NVIDIA driver and the standalone binary.
-**Source is open** — build it yourself or grab a pre-built release. See [License](#license) for dev-fee terms.
+build it yourself or grab a pre-built release. See [License](#license) for dev-fee terms.
 
 > Mixed-GPU rigs are supported: native code is compiled for Pascal/Turing/Ampere/Ada
 > (`sm_61/75/86/89`) plus a PTX fallback that JIT-loads on any newer NVIDIA card.
