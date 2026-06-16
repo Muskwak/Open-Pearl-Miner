@@ -129,8 +129,22 @@ empirically false. (Note: target is Ada/sm_89 RTX 4050 — AD107, 20 SM, 128 KB 
 
 **Conclusion: 21.4 TH/s (static 128×256 NT16 s3) is the firm structural ceiling.** Every
 occupancy/register lever (dynamic smem, carveout, WARPS_N) makes it worse; every ILP/load lever
-(ILP, swizzle, ldmatrix, B-amortization) is spent. ipminer's ~27 must come from a different
-algorithm or hand-tuned SASS, not from tuning this design. **21.4 bit-exact is the shipping kernel.**
+(ILP, swizzle, ldmatrix, B-amortization) is spent.
+
+### Clock-scaling check (iter 15) — the gap to 27 is NOT clock
+The 4050 (Laptop, 75 W cap, max boost 3105 MHz) was suspected power/clock-throttled — but ncu's
+"1.78 GHz" was just ncu locking to base. Live under load it runs **2430→2800 MHz at only 41 W / 51 °C**
+(power & thermal headroom). Pinned clock-scaling (`nvidia-smi -lgc f,f`):
+- 1500 MHz → **13.3 TH/s**;  2800 MHz → **21.0 TH/s**  (1.58× for a 1.87× clock → **sub-linear**)
+So it's part clock-bound, part memory-latency-bound. The card already boosts to ~2800 under load
+(unlocked 21.1 ≈ pinned-2800), max 3105 ⇒ only **~5 % clock headroom** (~22 at max). The tempting
+`21.1×3105/2430≈27` was a coincidence — **clock does not explain ipminer's 27**.
+
+**Final verdict: ~21 TH/s (2.67× baseline, 3.2× DP4A, bit-exact) is our ceiling for this design on
+this card.** ipminer's ~27 (~28 % more) is a genuine kernel/algorithm advantage (memory-latency
+hiding we haven't cracked) or a higher-TGP card — not reachable by tuning this structure. Shipping
+kernel = static `ldm` 128×256 NT16 s3. Levers tried & exhausted: ILP/wide, smem swizzle, dispatcher
+cache, ldmatrix, block/stage sweep, dynamic smem, carveout, WARPS_N occupancy, clock. **Stop here.**
 
 ## Invariant
 Every change must keep `bench_ampere.exe` reporting **BIT-EXACT PASS** (TC transcript ==
