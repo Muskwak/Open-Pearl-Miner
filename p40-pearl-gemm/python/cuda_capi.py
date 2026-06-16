@@ -55,6 +55,21 @@ _lib.p40_noise_apply_B.argtypes = [_VP, _VP, _VP, _VP, _VP, _VP, _I, _I, _I]
 _lib.p40_noise_gemm.argtypes = [_VP, _VP, _VP, _VP, _I, _I, _I]
 _lib.p40_pearl_pow_split.argtypes = [_VP, _VP, _I, _I, _I, _I, _VP, _VP, _VP, _VP, _VP, _VP, _I]
 _lib.p40_setup_job.argtypes = [_VP, _VP, _VP, _VP, _VP, _VP, _I, _I, _I, _I, ctypes.c_ulonglong]
+_lib.p40_init.argtypes = []
+_lib.p40_init.restype = _I
+_lib.p40_device_count.argtypes = []
+_lib.p40_device_count.restype = _I
+
+# Block-sync init: must run before this process creates a CUDA context, so that
+# sync() sleeps the CPU thread instead of spin-waiting. Critical for multi-GPU
+# rigs (one process per card) so the workers don't each burn a core. A non-fatal
+# error just leaves the default spin behavior, so the return is ignored.
+_lib.p40_init()
+
+
+def device_count() -> int:
+    """Number of CUDA devices visible to this process (0 if none / no driver)."""
+    return int(_lib.p40_device_count())
 
 
 def _chk(rc, what):

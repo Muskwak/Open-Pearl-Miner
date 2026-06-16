@@ -45,7 +45,7 @@ def build_proof(A: np.ndarray, B: np.ndarray, winning_row: int, winning_col: int
     li_B = pm.MerkleTree.compute_leaf_indices_from_rows(b_cols, (n, k))
     mp_A = pm.MatrixMerkleProof(tree_A.get_multileaf_proof(li_A), a_rows)
     mp_B = pm.MatrixMerkleProof(tree_B.get_multileaf_proof(li_B), b_cols)
-    return pm.PlainProof(m, n, k, noise_rank, mp_A, mp_B, None)
+    return pm.PlainProof(m, n, k, noise_rank, mp_A, mp_B)
 
 
 def build_proof_bt(A: np.ndarray, Bt: np.ndarray, winning_row: int, winning_col: int,
@@ -61,7 +61,7 @@ def build_proof_bt(A: np.ndarray, Bt: np.ndarray, winning_row: int, winning_col:
     li_B = pm.MerkleTree.compute_leaf_indices_from_rows(b_cols, (n, k))
     mp_A = pm.MatrixMerkleProof(tree_A.get_multileaf_proof(li_A), a_rows)
     mp_B = pm.MatrixMerkleProof(tree_B.get_multileaf_proof(li_B), b_cols)
-    return pm.PlainProof(m, n, k, noise_rank, mp_A, mp_B, None)
+    return pm.PlainProof(m, n, k, noise_rank, mp_A, mp_B)
 
 
 
