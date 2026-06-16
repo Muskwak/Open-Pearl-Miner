@@ -39,6 +39,9 @@ bottleneck** (BLAKE3 + noise + host overhead ≈ 10%). So optimize the GEMM.
 | 7 | Wire **wide NT16 (64×256)** into the dispatcher (n%256,m%64), NT8 fallback | TC path **8.9 → 16.2 TH/s (2.41× DP4A)** | ✅ shipped in `launch_pearl_ampere` |
 | 8 | **XOR-swizzle smem** (`kk ^ (((row>>2)&1)<<4)`) → conflict-free A/B frag loads, zero extra smem, bit-exact | NT16 17.6 → **18.0**; bank conflicts **35.7M → 0**, shared-ld wavefronts **72.6M → 37.0M** | ✅ shipped (`swz32`/`load_*_swz`) — small TH/s gain but unblocks ldmatrix |
 | 9 | **Cache the dispatcher arch check** (was calling `cudaGetDeviceProperties` per region, ~0.3 ms) | TC path 16.3 → **16.7** (~8% host tax removed; real-miner per-region) | ✅ shipped |
+| 10 | **ldmatrix loads, plain layout** (A `x4`→4 regs, B `x2`→2 regs, no `.trans`) | bit-exact; LSU pipe **61%→41%** but conflicts **back** (plain) → L1 72% → **17.7** (no net gain) | ❌ alone — each fix solves only half |
+| 11 | **ldmatrix + swizzle** (swizzle the per-lane ldmatrix addr — 16-byte-row granularity matches) | conflicts **0**, LSU 47%, L1 60%, **tensor 37.6%→43%** → **19.9** (64×256) | ✅ the combo unblocks the tensor pipe |
+| 12 | **Bigger block 128×256 s3** (8 warps share the B tile → amortize cp.async, cut `long_scoreboard`) | **21.1** (256×256 regresses: register spill, 1 blk) | ✅ shipped — dispatcher routes m%128,n%256 → `launch_ldm<128,256,8,1,16,3,1>` |
 
 ### Key insight — it was ILP all along
 `mma(acc,a,b,acc)` makes each accumulator a **serial dependency chain**. The fused kernel
@@ -54,8 +57,11 @@ TH/s must be computed from tiles **actually covered**: BM and BN must divide the
 cover fewer tiles and *inflate* TH/s. The bench now flags non-dividing configs with `*`.
 
 ## Current best
-**Wide NT=16 (64×256, 2 stages) = ~16–17.6 TH/s GEMM (≈33 INT8 TOPS, ~35% of peak)** —
-bit-exact, shipped via the dispatcher. **~2× the 8 TH/s baseline.**
+**`ldm` kernel, 128×256 NT16 3-stage = 21.4 TH/s GEMM (42.8 INT8 TOPS, 3.17× DP4A)** —
+bit-exact, shipped via the dispatcher. **2.67× the 8 TH/s baseline**, ~86% of ipminer's 25.
+(Steady-state with warmed clocks; `time_tc` needs ~60 warmup iters or it reads ~18 cold —
+the GPU boost clock ramps over the run, *not* a dispatcher overhead.)
+The climb: 8.0 → 16.3 (ILP/wide) → 18.0 (swizzle) → 19.9 (ldmatrix+swizzle) → 21.4 (128×256).
 
 ## End-to-end split (measured)
 BLAKE3 over the transcript = **0.025 ms/region**; GEMM = 4.22 ms. So GEMM is **99%**
@@ -90,6 +96,16 @@ tax (iter 9) were the two findings. **After** the swizzle: conflicts **0**, wave
    ILP gain from big NT cancels the occupancy gain from small NT. ILP ≥ occupancy here.
 
 So 25 TH/s likely needs **ldmatrix AND** an occupancy/latency win; ldmatrix alone ≈ 20–22 est.
+
+### Outcome (confirmed) + what's left to 25
+ldmatrix+swizzle landed at **21.4** (iter 10–12) — both predictions held: ldmatrix alone was a
+wash (conflicts returned), the combo unblocked the tensor pipe (37.6→43%), and the bigger
+128×256 block's B-amortization cut `long_scoreboard`. After iter 12 the kernel is still
+**latency-bound under 16.5% occupancy** (`wait` ~2.2 + `long_scoreboard` ~2.0, tensor ~43%).
+The remaining ~16% to 25 needs an **occupancy win that doesn't cost ILP** — the only real lever
+left is **dynamic shared memory** (`cudaFuncAttributeMaxDynamicSharedMemorySize`, up to 100 KB on
+Ada vs the 48 KB static cap) to fit more stages/blocks per SM. That's a bigger refactor (static
+`__shared__` → `extern __shared__`); deferred. 21.4 bit-exact is the shipping kernel.
 
 ## Invariant
 Every change must keep `bench_ampere.exe` reporting **BIT-EXACT PASS** (TC transcript ==

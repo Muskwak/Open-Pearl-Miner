@@ -44,7 +44,7 @@ static double ths_from(double tiles, double ms) {
 static double time_tc(const int8_t* A, const int8_t* Bt, int m, int n, int k,
                       int R, uint32_t* T, int iters) {
     cudaEvent_t a, b; CUDA_CHECK(cudaEventCreate(&a)); CUDA_CHECK(cudaEventCreate(&b));
-    for (int i = 0; i < 5; ++i) launch_pearl_ampere(A, Bt, m, n, k, R, T, 0); // warmup
+    for (int i = 0; i < 60; ++i) launch_pearl_ampere(A, Bt, m, n, k, R, T, 0); // warmup (ramp GPU clocks)
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaEventRecord(a));
     for (int i = 0; i < iters; ++i) launch_pearl_ampere(A, Bt, m, n, k, R, T, 0);
@@ -99,7 +99,8 @@ int main(int argc, char** argv) {
     // Usage: bench_ampere.exe prof [m] [n]   (defaults 4096x4096x4096 R256)
     // The ONLY tensor-core kernel launched here is the real-config wide kernel,
     // so `ncu -k pearl_ampere_wide_kernel -c 1` profiles exactly it (1024 blocks).
-    if (argc >= 2 && strcmp(argv[1], "prof") == 0) {
+    if (argc >= 2 && (strcmp(argv[1], "prof") == 0 || strcmp(argv[1], "profldm") == 0)) {
+        const bool use_ldm = (strcmp(argv[1], "profldm") == 0);
         int pm = (argc>=3?atoi(argv[2]):4096), pn = (argc>=4?atoi(argv[3]):4096), pk = 4096, pR = 256;
         size_t szA=(size_t)pm*pk, szBt=(size_t)pn*pk, szT=(size_t)(pm/16)*(pn/16)*16*4;
         int8_t *A,*Bt; uint32_t *T;
@@ -108,9 +109,10 @@ int main(int argc, char** argv) {
         fill_det<<<(unsigned)((szA+thr-1)/thr),thr>>>(A,szA,0x1111);
         fill_det<<<(unsigned)((szBt+thr-1)/thr),thr>>>(Bt,szBt,0x2222);
         CUDA_CHECK(cudaMemset(T,0,szT)); CUDA_CHECK(cudaDeviceSynchronize());
-        launch_pearl_ampere(A,Bt,pm,pn,pk,pR,T,0);
+        if (use_ldm) launch_ldm<64,256,4,1,16,2,1>(A,Bt,pm,pn,pk,pR,T,0);
+        else         launch_pearl_ampere(A,Bt,pm,pn,pk,pR,T,0);
         CUDA_CHECK(cudaDeviceSynchronize());
-        printf("prof: launched dispatcher @ %dx%dx%d R=%d\n", pm,pn,pk,pR);
+        printf("prof%s: launched @ %dx%dx%d R=%d\n", use_ldm?"ldm":"", pm,pn,pk,pR);
         cudaFree(A);cudaFree(Bt);cudaFree(T);
         return 0;
     }
@@ -290,6 +292,55 @@ int main(int argc, char** argv) {
     WIDE(64,192,4,1,12,2,1);
     WIDE(96,192,6,1,12,2,1);
     #undef WIDE
+
+    printf("\n--- ldm kernel (ldmatrix loads) ---\n");
+    {   // correctness vs DP4A
+        const int cm=256, cn=256, ck=(k>=4096?4096:k), cR=R;
+        const int ctiles=(cm/16)*(cn/16);
+        size_t szA=(size_t)cm*ck, szBt=(size_t)cn*ck, szTc=(size_t)ctiles*16*4;
+        int8_t *cA,*cBt; uint32_t *cTp,*cTa;
+        cudaMalloc(&cA,szA);cudaMalloc(&cBt,szBt);cudaMalloc(&cTp,szTc);cudaMalloc(&cTa,szTc);
+        int t2=256;
+        fill_det<<<(unsigned)((szA+t2-1)/t2),t2>>>(cA,szA,0x12345678);
+        fill_det<<<(unsigned)((szBt+t2-1)/t2),t2>>>(cBt,szBt,0x87654321);
+        cudaMemset(cTp,0,szTc);cudaMemset(cTa,0,szTc);cudaDeviceSynchronize();
+        launch_pearl_gemm_only(cA,cBt,cm,cn,ck,cR,cTp,1,0);
+        cudaError_t we=launch_ldm<64,256,4,1,16,2,1>(cA,cBt,cm,cn,ck,cR,cTa,0);
+        cudaDeviceSynchronize();
+        if(we!=cudaSuccess) printf("  launch err: %s\n",cudaGetErrorString(we));
+        else {
+            uint32_t *hp=(uint32_t*)malloc(szTc),*ha=(uint32_t*)malloc(szTc);
+            cudaMemcpy(hp,cTp,szTc,cudaMemcpyDeviceToHost);
+            cudaMemcpy(ha,cTa,szTc,cudaMemcpyDeviceToHost);
+            int d=0;for(int i=0;i<ctiles*16;i++)if(hp[i]!=ha[i])d++;
+            printf("  correctness (NT=16): %s (%d/%d differ)\n", d==0?"BIT-EXACT PASS":"FAIL", d, ctiles*16);
+            free(hp);free(ha);
+        }
+        cudaFree(cA);cudaFree(cBt);cudaFree(cTp);cudaFree(cTa);
+    }
+    #define LDM(BM,BN,WM,WN,NT,STG,MNB) do { \
+        double _at=(double)((m/BM)*(BM/16))*(double)((n/BN)*(BN/16)); \
+        const char* _bad=((m%BM)||(n%BN))?"*":" "; \
+        cudaEvent_t a,b;cudaEventCreate(&a);cudaEventCreate(&b); \
+        for(int i=0;i<5;i++) launch_ldm<BM,BN,WM,WN,NT,STG,MNB>(A,Bt,m,n,k,R,T,0); \
+        if(cudaDeviceSynchronize()!=cudaSuccess) printf("  ldm %dx%d NT%d s%d : launch failed\n",BM,BN,NT,STG); \
+        else { cudaEventRecord(a); \
+          for(int i=0;i<iters;i++) launch_ldm<BM,BN,WM,WN,NT,STG,MNB>(A,Bt,m,n,k,R,T,0); \
+          cudaEventRecord(b);cudaEventSynchronize(b);float ms=0;cudaEventElapsedTime(&ms,a,b);ms/=iters; \
+          printf("  ldm%s%3dx%-3d NT%-2d s%d : %.3f ms  %.2f TH/s\n",_bad,BM,BN,NT,STG,ms,ths_from(_at,ms)); } \
+        cudaEventDestroy(a);cudaEventDestroy(b); \
+    } while(0)
+    LDM(64,256,4,1,16,2,1);
+    LDM(64,256,4,1,16,3,1);
+    LDM(64,256,4,1,16,4,1);   // s5/s6 @64x256 exceed the 48KB static smem cap
+    LDM(64,128,4,1,8,3,2);
+    LDM(64,128,4,1,8,4,2);
+    LDM(64,128,4,1,8,6,2);
+    LDM(128,256,8,1,16,2,1);
+    LDM(128,256,8,1,16,3,1);
+    LDM(256,256,16,1,16,2,1);   // biggest block: 16 warps share B (max amortization)
+    LDM(256,128,16,1,8,3,1);
+    #undef LDM
 
     printf("\n--- wide1 kernel (1 sync/k-tile) ---\n");
     {   // correctness vs DP4A
