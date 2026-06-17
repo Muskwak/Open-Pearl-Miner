@@ -8,7 +8,7 @@ in pre-built releases. Just an NVIDIA driver and the standalone binary.
 build it yourself or grab a pre-built release. See [License](#license) for dev-fee terms.
 
 > Mixed-GPU rigs are supported, optomized for pascal for now. but experimental ternsor core support has been added.
-> y
+> 
 ## Features
 
 - **~7.0 TH/s** sustained on a single Tesla P40.
@@ -19,7 +19,7 @@ build it yourself or grab a pre-built release. See [License](#license) for dev-f
 - **Solo mining** — mine to your local pearl-gateway node.
 - **Pool mining** — built for LuckyPool's Pearl stratum (default) with more pool protocols planned.
 - **HiveOS** — full HiveOS custom-miner package.
-  y
+  
 
 ## Pre-built Releases
 
