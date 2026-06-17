@@ -117,6 +117,83 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // ---------- tcths: fast A/B mode — bit-exact check + steady-state TC TH/s only ----------
+    // Usage: bench_ampere.exe tcths [iters]   (4096x4096x4096 R256). For controlled
+    // back-to-back comparisons (e.g. kernel-name A/B) without the full sweep.
+    if (argc >= 2 && strcmp(argv[1], "tcths") == 0) {
+        int it = (argc >= 3 ? atoi(argv[2]) : 200);
+        {   const int cm=256,cn=256,ck=4096,cR=256; const int tl=(cm/16)*(cn/16);
+            size_t aA=(size_t)cm*ck,aB=(size_t)cn*ck,aT=(size_t)tl*16*4;
+            int8_t *A,*B; uint32_t *Tp,*Ta;
+            cudaMalloc(&A,aA);cudaMalloc(&B,aB);cudaMalloc(&Tp,aT);cudaMalloc(&Ta,aT);
+            fill_det<<<(unsigned)((aA+255)/256),256>>>(A,aA,0x12345678);
+            fill_det<<<(unsigned)((aB+255)/256),256>>>(B,aB,0x87654321);
+            cudaMemset(Tp,0,aT);cudaMemset(Ta,0,aT);cudaDeviceSynchronize();
+            launch_pearl_gemm_only(A,B,cm,cn,ck,cR,Tp,1,0);
+            launch_pearl_ampere(A,B,cm,cn,ck,cR,Ta,0);
+            cudaDeviceSynchronize();
+            uint32_t *hp=(uint32_t*)malloc(aT),*ha=(uint32_t*)malloc(aT);
+            cudaMemcpy(hp,Tp,aT,cudaMemcpyDeviceToHost);cudaMemcpy(ha,Ta,aT,cudaMemcpyDeviceToHost);
+            int diff=0; for(int i=0;i<tl*16;i++) if(hp[i]!=ha[i]) diff++;
+            printf("tcths: %s (%d/%d differ)\n", diff==0?"BIT-EXACT PASS":"BIT-EXACT FAIL", diff, tl*16);
+            cudaFree(A);cudaFree(B);cudaFree(Tp);cudaFree(Ta);free(hp);free(ha);
+        }
+        const int M=4096,N=4096,K=4096,RR=256;
+        const double tiles=(double)(M/16)*(N/16);
+        size_t szA=(size_t)M*K,szBt=(size_t)N*K,szT=(size_t)(M/16)*(N/16)*16*4;
+        int8_t *A,*Bt; uint32_t *T;
+        cudaMalloc(&A,szA);cudaMalloc(&Bt,szBt);cudaMalloc(&T,szT);
+        fill_det<<<(unsigned)((szA+255)/256),256>>>(A,szA,0x1111);
+        fill_det<<<(unsigned)((szBt+255)/256),256>>>(Bt,szBt,0x2222);
+        cudaMemset(T,0,szT);cudaDeviceSynchronize();
+        double ms=time_tc(A,Bt,M,N,K,RR,T,it);
+        printf("tcths: %.3f ms/region -> %.2f TH/s  (iters=%d)\n", ms, ths_from(tiles,ms), it);
+        cudaFree(A);cudaFree(Bt);cudaFree(T);
+        return 0;
+    }
+
+    // ---------- ws: warp-specialized kernel — bit-exact check + steady-state TH/s ----------
+    // Usage: bench_ampere.exe ws [iters]   (128x256 WS kernel direct, 4096^2 R256)
+    if (argc >= 2 && strcmp(argv[1], "ws") == 0) {
+        int it = (argc >= 3 ? atoi(argv[2]) : 200);
+        {   const int cm=256,cn=256,ck=4096,cR=256; const int tl=(cm/16)*(cn/16);
+            size_t aA=(size_t)cm*ck,aB=(size_t)cn*ck,aT=(size_t)tl*16*4;
+            int8_t *A,*B; uint32_t *Tp,*Ta;
+            cudaMalloc(&A,aA);cudaMalloc(&B,aB);cudaMalloc(&Tp,aT);cudaMalloc(&Ta,aT);
+            fill_det<<<(unsigned)((aA+255)/256),256>>>(A,aA,0x12345678);
+            fill_det<<<(unsigned)((aB+255)/256),256>>>(B,aB,0x87654321);
+            cudaMemset(Tp,0,aT);cudaMemset(Ta,0,aT);cudaDeviceSynchronize();
+            launch_pearl_gemm_only(A,B,cm,cn,ck,cR,Tp,1,0);
+            cudaError_t e=launch_ws<128,256,8,1,16,3,1>(A,B,cm,cn,ck,cR,Ta,0);
+            if(e!=cudaSuccess){fprintf(stderr,"ws launch: %s\n",cudaGetErrorString(e));return 1;}
+            cudaDeviceSynchronize();
+            uint32_t *hp=(uint32_t*)malloc(aT),*ha=(uint32_t*)malloc(aT);
+            cudaMemcpy(hp,Tp,aT,cudaMemcpyDeviceToHost);cudaMemcpy(ha,Ta,aT,cudaMemcpyDeviceToHost);
+            int diff=0; for(int i=0;i<tl*16;i++) if(hp[i]!=ha[i]) diff++;
+            printf("ws: %s (%d/%d differ)\n", diff==0?"BIT-EXACT PASS":"BIT-EXACT FAIL", diff, tl*16);
+            cudaFree(A);cudaFree(B);cudaFree(Tp);cudaFree(Ta);free(hp);free(ha);
+        }
+        const int M=4096,N=4096,K=4096,RR=256;
+        const double tiles=(double)(M/16)*(N/16);
+        size_t szA=(size_t)M*K,szBt=(size_t)N*K,szT=(size_t)(M/16)*(N/16)*16*4;
+        int8_t *A,*Bt; uint32_t *T;
+        cudaMalloc(&A,szA);cudaMalloc(&Bt,szBt);cudaMalloc(&T,szT);
+        fill_det<<<(unsigned)((szA+255)/256),256>>>(A,szA,0x1111);
+        fill_det<<<(unsigned)((szBt+255)/256),256>>>(Bt,szBt,0x2222);
+        cudaMemset(T,0,szT);cudaDeviceSynchronize();
+        cudaEvent_t a,b; cudaEventCreate(&a); cudaEventCreate(&b);
+        for(int i=0;i<60;i++) launch_ws<128,256,8,1,16,3,1>(A,Bt,M,N,K,RR,T,0);
+        cudaDeviceSynchronize();
+        cudaEventRecord(a);
+        for(int i=0;i<it;i++) launch_ws<128,256,8,1,16,3,1>(A,Bt,M,N,K,RR,T,0);
+        cudaEventRecord(b); cudaEventSynchronize(b);
+        float ms=0; cudaEventElapsedTime(&ms,a,b); ms/=it;
+        printf("ws: %.3f ms/region -> %.2f TH/s  (iters=%d)\n", ms, ths_from(tiles,ms), it);
+        cudaEventDestroy(a);cudaEventDestroy(b);
+        cudaFree(A);cudaFree(Bt);cudaFree(T);
+        return 0;
+    }
+
     // ---------- bit-exact correctness (small grid, real R) ----------
     {
         const int cm = 256, cn = 256, ck = (k >= 4096 ? 4096 : k), cR = R;
@@ -426,6 +503,49 @@ int main(int argc, char** argv) {
     LDMC(64,128,4,1,8,3,64);
     LDMC(64,128,4,1,8,3,100);
     #undef LDMC
+
+    printf("\n--- ldm_flat kernel (single flat cp.async pipeline, no per-R-block drain) ---\n");
+    {   // correctness vs DP4A
+        const int cm=256, cn=256, ck=(k>=4096?4096:k), cR=R;
+        const int ctiles=(cm/16)*(cn/16);
+        size_t szA=(size_t)cm*ck, szBt=(size_t)cn*ck, szTc=(size_t)ctiles*16*4;
+        int8_t *cA,*cBt; uint32_t *cTp,*cTa;
+        cudaMalloc(&cA,szA);cudaMalloc(&cBt,szBt);cudaMalloc(&cTp,szTc);cudaMalloc(&cTa,szTc);
+        int t2=256;
+        fill_det<<<(unsigned)((szA+t2-1)/t2),t2>>>(cA,szA,0x12345678);
+        fill_det<<<(unsigned)((szBt+t2-1)/t2),t2>>>(cBt,szBt,0x87654321);
+        cudaMemset(cTp,0,szTc);cudaMemset(cTa,0,szTc);cudaDeviceSynchronize();
+        launch_pearl_gemm_only(cA,cBt,cm,cn,ck,cR,cTp,1,0);
+        cudaError_t we=launch_ldm_flat<128,256,8,1,16,3,1>(cA,cBt,cm,cn,ck,cR,cTa,0);
+        cudaDeviceSynchronize();
+        if(we!=cudaSuccess) printf("  launch err: %s\n",cudaGetErrorString(we));
+        else {
+            uint32_t *hp=(uint32_t*)malloc(szTc),*ha=(uint32_t*)malloc(szTc);
+            cudaMemcpy(hp,cTp,szTc,cudaMemcpyDeviceToHost);
+            cudaMemcpy(ha,cTa,szTc,cudaMemcpyDeviceToHost);
+            int d=0;for(int i=0;i<ctiles*16;i++)if(hp[i]!=ha[i])d++;
+            printf("  correctness (flat NT=16): %s (%d/%d differ)\n", d==0?"BIT-EXACT PASS":"FAIL", d, ctiles*16);
+            free(hp);free(ha);
+        }
+        cudaFree(cA);cudaFree(cBt);cudaFree(cTp);cudaFree(cTa);
+    }
+    #define LDMF(BM,BN,WM,WN,NT,STG,MNB) do { \
+        double _at=(double)((m/BM)*(BM/16))*(double)((n/BN)*(BN/16)); \
+        cudaEvent_t a,b;cudaEventCreate(&a);cudaEventCreate(&b); \
+        for(int i=0;i<60;i++) launch_ldm_flat<BM,BN,WM,WN,NT,STG,MNB>(A,Bt,m,n,k,R,T,0); \
+        if(cudaDeviceSynchronize()!=cudaSuccess) printf("  ldmf %dx%d NT%d s%d : launch failed\n",BM,BN,NT,STG); \
+        else { cudaEventRecord(a); \
+          for(int i=0;i<iters;i++) launch_ldm_flat<BM,BN,WM,WN,NT,STG,MNB>(A,Bt,m,n,k,R,T,0); \
+          cudaEventRecord(b);cudaEventSynchronize(b);float ms=0;cudaEventElapsedTime(&ms,a,b);ms/=iters; \
+          printf("  ldmf %3dx%-3d NT%-2d s%d : %.3f ms  %.2f TH/s\n",BM,BN,NT,STG,ms,ths_from(_at,ms)); } \
+        cudaEventDestroy(a);cudaEventDestroy(b); \
+    } while(0)
+    LDMF(128,256,8,1,16,2,1);
+    LDMF(128,256,8,1,16,3,1);
+    LDMF(64,256,4,1,16,3,1);
+    LDMF(64,256,4,1,16,4,1);
+    LDMF(64,128,4,1,8,4,2);
+    #undef LDMF
 
     printf("\n--- wide1 kernel (1 sync/k-tile) ---\n");
     {   // correctness vs DP4A

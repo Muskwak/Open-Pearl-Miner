@@ -42,6 +42,9 @@ bottleneck** (BLAKE3 + noise + host overhead ≈ 10%). So optimize the GEMM.
 | 10 | **ldmatrix loads, plain layout** (A `x4`→4 regs, B `x2`→2 regs, no `.trans`) | bit-exact; LSU pipe **61%→41%** but conflicts **back** (plain) → L1 72% → **17.7** (no net gain) | ❌ alone — each fix solves only half |
 | 11 | **ldmatrix + swizzle** (swizzle the per-lane ldmatrix addr — 16-byte-row granularity matches) | conflicts **0**, LSU 47%, L1 60%, **tensor 37.6%→43%** → **19.9** (64×256) | ✅ the combo unblocks the tensor pipe |
 | 12 | **Bigger block 128×256 s3** (8 warps share the B tile → amortize cp.async, cut `long_scoreboard`) | **21.1** (256×256 regresses: register spill, 1 blk) | ✅ shipped — dispatcher routes m%128,n%256 → `launch_ldm<128,256,8,1,16,3,1>` |
+| 16 | **`cp.async.cg` (L1 bypass)** — `.cg` (L2-only) instead of `.ca`; ncu showed L1 hit = 0.59% (useless) yet cp.async still floods the L1/MIO pipe | **21.4 → 23.4 (+10%)** | ✅ shipped — single biggest post-iter-12 win; frees the MIO pipe for ldmatrix |
+| 17 | **`ldmatrix.x4` B-load** (`ldm_B2_frag`) — one `ldmatrix.x4` returns both bL+bR k-halves of a B tile, replacing two `ldmatrix.x2` calls → ½ the B-load instrs | **23.4 → 24.0 (+2.4%)** | ✅ shipped — bit-exact; tensor pipe 43%→48.7% |
+| 18 | **"cutlass" kernel-name ptxas hack** — rename `pearl_ampere_ldm_kernel`→`cutlass_pearl_ampere_ldm_kernel`; ptxas gates a more aggressive load↔math scheduling pass on the `cutlass` substring | **+1.0%** (24.085 vs 23.838 mean, n=6 each) | ⚠️ real but marginal — **NOT adopted** (name-hack fragility); recorded only |
 
 ### Key insight — it was ILP all along
 `mma(acc,a,b,acc)` makes each accumulator a **serial dependency chain**. The fused kernel
@@ -145,6 +148,134 @@ this card.** ipminer's ~27 (~28 % more) is a genuine kernel/algorithm advantage 
 hiding we haven't cracked) or a higher-TGP card — not reachable by tuning this structure. Shipping
 kernel = static `ldm` 128×256 NT16 s3. Levers tried & exhausted: ILP/wide, smem swizzle, dispatcher
 cache, ldmatrix, block/stage sweep, dynamic smem, carveout, WARPS_N occupancy, clock. **Stop here.**
+
+### Ultrathink (iter 16–17) — the "21.4 ceiling" was wrong; two real wins remained
+The iter-15 "stop here" verdict was **premature**. Re-profiling found two levers it had missed,
+both bit-exact, both in the *load/MIO* path (not occupancy):
+- **iter 16 — `cp.async.cg`**: ncu showed the cp.async traffic was hammering L1/MIO for a **0.59 %**
+  L1 hit rate (the data is streamed once, never reused before eviction). Switching `.ca`→`.cg`
+  (bypass L1, land in L2) frees the entire L1/MIO pipe. **+10 % (21.4 → 23.4)** — the single biggest
+  post-iter-12 win, and exactly the "memory-latency hiding we haven't cracked" gap iter-15 hand-waved.
+- **iter 17 — `ldmatrix.x4` B-load**: collapse the two `ldmatrix.x2` B-frag loads into one
+  `ldmatrix.x4` (`ldm_B2_frag`). Half the B-load instructions → tensor pipe **43 % → 48.7 %**.
+  **+2.4 % (23.4 → 24.0)**.
+
+**New best: 24.0 TH/s** (3.0× the 8.0 baseline, 3.57× DP4A, bit-exact). Climb in full:
+8.0 → 16.3 (ILP/wide) → 18.0 (swizzle) → 19.9 (ldmatrix+swizzle) → 21.4 (128×256) →
+**23.4 (cp.async.cg)** → **24.0 (ldmatrix.x4)**.
+
+Falsified dead-ends from this round (recorded so we don't re-try them): `cp.async` `.L2::256B`
+prefetch hint (no gain over `.cg`), flat 1-sync pipeline (`ldm_flat`, 21.7 < 24.0 — the per-R-block
+pipeline issues its prefetch at the top of the loop = better load lead), B-prefetch, fold-interleave.
+
+### Why lpminer hits ~27 and we cap at 24 — from disassembling the competitor
+Disassembled `E:\lpminer-0.1.10\lpminer.exe` (cuobjdump, CUDA 12.8). Its sm_89 mining GEMM is
+`pearl::ampere_dedicated_mining_ws< Sm80KernelTraits<int8, half, half, float, tuple<C<128>,C<256>>, …>,
+StaticPersistentTileScheduler >` — **REG:255, dynamic smem, CUTLASS/CuTe**. The edge over our
+hand-written kernel is two things we structurally cannot express in this single-loop design:
+1. **Warp specialization** (`_ws`): dedicated *producer* (cp.async) warps + *consumer* (MMA) warps.
+   The consumer warps get the **full 255-reg budget for accumulator chains** → many more MMAs in
+   flight → hides the dominant `wait` (MMA-dependency) stall that caps us. Our kernel makes every
+   warp do both load and compute, so registers are split and ILP is bounded.
+2. **Persistent scheduling** (`StaticPersistentTileScheduler`): grid-resident blocks loop over tiles
+   → no wave-quantization bubbles + a hot L2 working set (cuts `long_scoreboard`).
+The CTA tile is **128×256 — identical to what we found best**. So we reached **89 % of lpminer
+(24.0 / ~27) with lean, bit-exact, hand-written PTX**; the last ~11 % is *not* a tweak — it needs a
+CUTLASS-style warp-specialized persistent mainloop with a custom Pearl-transcript epilogue (multi-day
+effort + large dependency). See memory `lpminer-technique.md`. The pearl-research-labs reference is
+CUTLASS too, but sm_90-only; lpminer wrote its own `Sm80KernelTraits` warp-spec path for Ampere/Ada.
+
+### Settled: the "cutlass" kernel-name ptxas hack (+1%, NOT adopted)
+The viral "FP8 is 150 TFLOPS faster when the kernel name contains `cutlass`" claim — ptxas keys a
+more aggressive load↔math scheduling pass off the `cutlass` substring in the symbol. Tested it
+properly: built two binaries identical except the kernel symbol (`pearl_ampere_ldm_kernel` vs
+`cutlass_pearl_ampere_ldm_kernel`), ran a controlled back-to-back A/B (`tcths` mode, 300 iters,
+n=6 each, both orderings to cancel thermal drift):
+```
+            run1   run2   run3  | run4   run5   run6  | mean
+cutlass :  24.12  24.06  24.03  | 24.25  24.04  24.01 | 24.085
+orig    :  24.08  23.84  23.78  | 23.82  23.81  23.70 | 23.838
+```
+**Real and reproducible (+1.0%), but NOT the FP8 magnitude.** cutlass-named wins every adjacent pair
+in BOTH orderings (so it's the name, not run-order). Why only +1% for us: that pass recovers
+*load-scheduling* slack; our int8 `mma.sync` kernel has **no spills** and is bound on the
+**MMA-dependency `wait` stall**, not load scheduling, so it only tightens the `ldmatrix`/IMMA
+interleave a hair. **Not adopted** — a published miner shouldn't depend on an undocumented,
+driver-version-fragile name heuristic for 0.25 TH/s; recorded as a curiosity. (Bench `tcths` mode +
+the throwaway `bench_orig`/`bench_cutlass` binaries were the test rig.)
+
+## Roadmap to 27 TH/s — the warp-specialized persistent rewrite
+24.1 is the ceiling of the **single-loop design** (every warp loads AND computes). lpminer's ~27 comes
+from a structure we haven't built: **warp specialization + persistence** ([[lpminer-technique]]). This
+is the plan to get there, bit-exact.
+
+**Core insight — why warp-spec wins on Ada (no `setmaxnreg`!).** Ampere/Ada have **no per-warp
+register reallocation** (`setmaxnreg` is sm_90+). So the win is NOT "donate producer regs to
+consumers." It is **instruction-stream decoupling**: today each consumer warp interleaves `cp.async`
+(global→smem) + address math between its IMMAs, so the warp scheduler can't issue MMA back-to-back
+(`mio_throttle` 2.04, tensor pipe only 48.7%). Move ALL `cp.async` onto a few dedicated **producer**
+warps; the **consumer** warps then issue a dense `ldmatrix→IMMA→IMMA…` stream with no global-load
+contention. Producers run ahead through a named-barrier ring so consumers never stall on DRAM/L2
+(kills `long_scoreboard`). Net: tensor pipe rises from 48.7% toward ~60–80%.
+
+**The gain math (why 27 is realistic, not aspirational):** throughput ∝ tensor-pipe utilization.
+24.1 TH/s @ 48.7% ⇒ each +1pt util ≈ +0.49 TH/s. **27 needs only ~54.5% util** — a modest lift that
+WS directly targets; ~60% util ≈ 29.7 TH/s (headroom above 27). lpminer proves ~55%+ is reachable on
+this exact silicon. So the structure, not the clock or the card, is the gap.
+
+**Design (hand-rolled, NOT CUTLASS).** CUTLASS does *not* give Ampere warp-spec for free — stock CUTLASS
+Sm80 collectives are multistage (not `_ws`); lpminer wrote custom `Sm80KernelTraits`. And our
+**in-mainloop R-block transcript fold** (16× per region, rotate-13 XOR, continuous accumulation) is
+not a standard end-of-loop epilogue a CUTLASS EpilogueVisitor can express. We already own every
+bit-exact piece (`swz32`, `ldm_A_frag`, `ldm_B2_frag`, `.cg cp.async`, the fold). So **extend our
+kernel**, using CUTLASS only as a reference for mbarrier-pipeline patterns.
+- **CTA tile: keep 128×256** (proven best; matches lpminer).
+- **Warps: 8 consumers (→ 8 row-tiles ×16, 32 frags = 128 accum regs each, ~our current consumer body)
+  + 2 producers** = 10 warps / 320 threads. Reg budget 65536/320 = 204/thread ⇒ still 1 block/SM
+  (consumers ~180, producers ~40 "wasted" but we're not at the 65536 wall, so it's free).
+- **Sync: HW named-barrier ring** (`bar.arrive`/`bar.sync`, 16 IDs/CTA), NOT mbarrier. Named barriers
+  are stateless rendezvous → no phase-bit to mismanage (mbarrier's #1 deadlock source) and native
+  subset-sync for the producer/consumer groups. They do **control** handoff only; keep
+  `cp.async.commit_group`/`wait_group` for **data-landed** (we already use these). Per stage: a
+  `full[S]` barrier (producer `bar.arrive` after `wait_group` confirms the copy landed; consumer
+  `bar.sync` before reading) and an `empty[S]` barrier (consumer `bar.arrive` after consuming;
+  producer `bar.sync` before reusing buffer S). 2·STAGES ≤ 16 IDs ⇒ STAGES ≤ 8 (we run 3–5).
+  CUTLASS uses `arch::NamedBarrier` for the same Ampere cross-warp handoff — battle-tested.
+  *Tradeoff:* slightly coarser producer look-ahead than `cp.async.mbarrier.arrive`; negligible at
+  3–5 stages. mbarrier is a **conditional P3 upgrade** only if residual `long_scoreboard` proves
+  look-ahead is the limiter. *Gotcha:* exact thread counts + no participant early-exit/divergence
+  before its arrive/sync or it hangs — near-zero risk for us (full 128×256 tiles, no ragged boundary).
+- **Only consumers fold the transcript**; intra-warp ordering already guarantees the fold reads
+  completed R-block accumulators (no cross-warp accumulator sharing — low bit-exact risk).
+
+**Phased plan (bit-exact gate after EVERY phase = revert on regression):**
+- **P0 scaffold (½d):** add `pearl_ampere_ws_kernel` + `ws`/`profws` bench modes + DP4A bit-exact check,
+  beside the shipping kernel (don't touch the live path). Reuse all existing bit-exact device fns.
+- **P1 named-barrier ring, NO split (1d):** swap the `__syncthreads` double-buffer for a named-barrier
+  (`bar.arrive`/`bar.sync`) multi-stage ring with ALL warps still homogeneous (load+compute). Isolates
+  the **ring-buffer mechanics** — stage indexing, smem-offset rotation, cp.async group depth, staged
+  data flow — decoupled from warp roles, with dead-simple sync (no phase bits). Gate: BIT-EXACT, ≈24.
+- **P2 warp specialization (2–3d, the core):** flip warps into roles — wrap the produce path in
+  `if (warp<2)`, the consume path in `if (warp>=2)`, pointing at the *same* barrier IDs (the P1 ring is
+  unchanged; only who calls `arrive` vs `sync` changes). 8 consumer + 2 producer. Gate: BIT-EXACT, then
+  measure — **the jump toward 27 lands here.** Tune STAGES{3,4,5}, producers{2,3,4}.
+- **P3 ILP/SASS tune (1d):** with cp.async off consumers, densify the IMMA issue (back-to-back, A-operand
+  `.reuse`); verify in `nvdisasm` the consumer loop is MMA-dense. Maybe push NT within 255 regs.
+  *Conditional:* if residual `long_scoreboard` shows producer look-ahead is the limiter, upgrade the
+  named-barrier ring → **mbarrier** (`cp.async.mbarrier.arrive` unifies data+control) for deeper overlap.
+- **P4 persistence (1–2d):** launch `num_SM × blk/SM` (~20–40) persistent blocks; static-partition the
+  512 region-tiles (block b ⇒ tiles b, b+G, …); order tiles for L2 reuse (n fastest within an m-band so
+  A-rows stay hot). Overlap tile-T epilogue with T+1 prologue only if needed. Gate: BIT-EXACT, +2–4%.
+- **P5 integrate (½d):** dispatcher routes 128×256 region → WS kernel (old kernel = fallback); validate
+  bit-exact at real 131072² multi-region + sustained TH/s + thermals; A/B vs lpminer at the pool.
+
+**Total ≈ 6–8 focused days.** Risks: (1) named-barrier hang from miscounted thread totals or a
+participant diverging/exiting before its arrive/sync — *now the main risk, but low*: full 128×256
+tiles → no ragged-boundary divergence, and P1 isolation + diffing against the known-good 24.0 kernel
+at small grids catches indexing bugs early. (2) producers can't sustain cp.async rate → consumer
+starvation → no gain; mitigated by tunable producer count. (3) WS may land at 25–26 not full 27 —
+still beats 24.1 and is 93–96% of lpminer. Intermediate success = any bit-exact result >24.1 with
+tensor pipe >55%.
 
 ## Invariant
 Every change must keep `bench_ampere.exe` reporting **BIT-EXACT PASS** (TC transcript ==
