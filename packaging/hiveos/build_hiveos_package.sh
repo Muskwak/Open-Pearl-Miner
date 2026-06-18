@@ -25,7 +25,12 @@ cp -r "$DIST/." "$PKG/bin/"
 
 chmod +x "$PKG"/h-*.sh "$PKG/bin/p40-miner"
 
-OUT="$(pwd)/p40-miner-hiveos-${VER}.tar.gz"
+# HiveOS derives the miner name from the tarball filename as <name>-<version>, and
+# REQUIRES the archive to extract to a folder named exactly <name> == CUSTOM_NAME.
+# So the file MUST be p40-miner-<ver>.tar.gz (NOT p40-miner-hiveos-...): a "-hiveos"
+# suffix makes HiveOS look for a "p40-miner-hiveos" folder that doesn't exist, and the
+# miner never launches from the flight sheet.
+OUT="$(pwd)/${CUSTOM_NAME:-p40-miner}-${VER}.tar.gz"
 tar -C "$STAGE" -czf "$OUT" p40-miner
 rm -rf "$STAGE"
 

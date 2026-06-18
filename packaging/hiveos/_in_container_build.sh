@@ -44,7 +44,7 @@ test -x dist_linux/p40-miner/p40-miner
 echo "=== [4/4] assemble HiveOS tarball ==="
 cd "$P40"
 DIST=dist_linux/p40-miner bash packaging/hiveos/build_hiveos_package.sh
-cp -v p40-miner-hiveos-*.tar.gz "$OUT"/
+cp -v p40-miner-[0-9]*.tar.gz "$OUT"/   # p40-miner-<ver>.tar.gz (HiveOS name == CUSTOM_NAME)
 cp -v "$WHEEL" "$OUT"/
 cp -rv dist_linux/p40-miner "$OUT"/p40-miner-linux-dist
 # world-readable so the host user can read root-owned outputs

@@ -193,18 +193,34 @@ The same 2% dev fee applies (GPU mines to the dev's pool wallet during the 2% wi
 
 ## HiveOS
 
-Download `p40-miner-hiveos-1.6.0.tar.gz` and install it as a **Custom** miner:
+> **The Custom miner name must be exactly `p40-miner`.** HiveOS derives the miner name
+> from the package (`p40-miner-<version>.tar.gz` → folder `p40-miner/` → `CUSTOM_NAME`).
+> If the name doesn't match, the agent can't find `h-run.sh` and **the miner never
+> launches** from the flight sheet. Keep the asset filename as `p40-miner-<version>.tar.gz`.
 
-1. **Flight Sheet → Miner = Custom.**
-2. Set the **Installation URL** to the tarball, *or* `scp` it to the rig and run
-   `tar -C /hive/miners/custom -xzf p40-miner-hiveos-1.6.0.tar.gz`.
-3. **Wallet and worker:** your Pearl wallet `prl1...` (worker name auto-appended).
-4. **Pool URL:** `pearl-eu2.luckypool.io:3360` (default LuckyPool GPU pool).
-5. **Extra config arguments** (optional): `--devices 0,1`, `--region 4096`, etc.
+Install as a **Custom** miner:
 
-The miner reports per-GPU TH/s and accepted shares to the HiveOS dashboard.
-Built against glibc 2.31, so it runs on both the *focal* (20.04) and *jammy* (22.04)
-HiveOS images and newer.
+1. **Flight Sheet → Miner → Custom → Setup Miner Config.**
+2. **Miner name:** `p40-miner` (exactly — this becomes `/hive/miners/custom/p40-miner/`).
+3. **Installation URL:**
+   `https://github.com/Muskwak/Open-Pearl-Miner/releases/download/v1.6.0/p40-miner-1.6.0.tar.gz`
+4. **Wallet and worker template:** your Pearl wallet `prl1...` (worker auto-appended).
+5. **Pool URL:** Pascal rigs (P40 / GTX 10-series) → `pearl-cpu-eu1.luckypool.io:3370`;
+   tensor-core cards (sm_80+) → `pearl-eu2.luckypool.io:3360`.
+6. **Extra config arguments** (optional): `--devices 0,1`, `--region 4096`, etc.
+
+Or install manually instead of via the URL:
+
+```bash
+cd /tmp && wget -O p40-miner-1.6.0.tar.gz \
+  https://github.com/Muskwak/Open-Pearl-Miner/releases/download/v1.6.0/p40-miner-1.6.0.tar.gz
+tar -C /hive/miners/custom -xzf p40-miner-1.6.0.tar.gz   # -> /hive/miners/custom/p40-miner/
+```
+
+The miner reports per-GPU TH/s and accepted shares to the HiveOS dashboard. Built against
+glibc 2.31, so it runs on focal (20.04), jammy (22.04), and newer HiveOS images.
+**Requires NVIDIA driver ≥ 525** (the CUDA 12 runtime) — update the rig's driver if older,
+or the miner can't initialise the GPU.
 
 ## Dev Fee
 
