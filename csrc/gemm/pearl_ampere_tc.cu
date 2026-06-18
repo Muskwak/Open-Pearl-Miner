@@ -9,6 +9,11 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+// Fused CuTe kernel (int8 GEMM + in-mainloop transcript fold), ~32.75 TH/s on Ada,
+// bit-exact with DP4A. Primary 128x256 path; the hand `ldm` kernels below remain as
+// fallbacks for non-32-aligned R and smaller alignments. Namespaced (pcute::).
+#include "pearl_cute_fold.cuh"
+
 // ==================================================================
 // PTX helper functions — device-only (use asm which requires sm_80+)
 // ==================================================================
@@ -787,6 +792,158 @@ cudaError_t launch_ldm(const int8_t* A, const int8_t* Bt, int m, int n,
     return cudaGetLastError();
 }
 
+// ---- Hardware named barriers (bar.sync / bar.arrive, 16 IDs/CTA) -------------------
+// nb_sync(id,cnt): blocking arrive-and-wait on barrier `id` for `cnt` threads (id 0 +
+//   full count == __syncthreads). nb_arrive(id,cnt): non-blocking arrive (signal only).
+// All threads naming a barrier must agree on `cnt` (a multiple of warpSize) or it hangs.
+// These back the warp-specialized producer/consumer ring (see dev.md "Roadmap to 27").
+__device__ __forceinline__ void nb_sync(int id, int cnt) {
+    asm volatile("bar.sync %0, %1;" :: "r"(id), "r"(cnt) : "memory");
+}
+__device__ __forceinline__ void nb_arrive(int id, int cnt) {
+    asm volatile("bar.arrive %0, %1;" :: "r"(id), "r"(cnt) : "memory");
+}
+
+// ==================================================================
+// ws kernel: the warp-specialized rewrite, built incrementally (dev.md roadmap).
+//   P0/P1 (this revision): an EXACT clone of `ldm`, but every __syncthreads() is a HW
+//   named barrier (nb_sync id 0 == __syncthreads). Warps are still homogeneous (all
+//   load+compute) — this proves the scaffold + the named-barrier primitive are
+//   BIT-EXACT at the 24.0 baseline before the real producer/consumer split.
+//   P2 (next): producers (warp < PWARPS) run only the PRODUCE block + bar.arrive(full[s]);
+//   consumers (warp >= PWARPS) run only the CONSUME block + bar.sync(full[s]) /
+//   bar.arrive(empty[s]). The two blocks are kept textually separable for that split.
+// Bit-exact with ldm / DP4A.
+// ==================================================================
+template <int BLOCK_M, int BLOCK_N, int BLOCK_K, int WARPS_M, int WARPS_N,
+          int NT, int STAGES, int MINB>
+__global__ void __launch_bounds__(WARPS_M * WARPS_N * 32, MINB)
+pearl_ampere_ws_kernel(
+    const int8_t* __restrict__ A, const int8_t* __restrict__ Bt,
+    int n, int k, int R, uint32_t* __restrict__ transcript_buffer)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    static_assert(BLOCK_M == WARPS_M * 16, "BLOCK_M must equal WARPS_M*16");
+    static_assert(BLOCK_N == WARPS_N * NT * 16, "BLOCK_N must equal WARPS_N*NT*16");
+    static_assert(BLOCK_K == 32, "BLOCK_K must equal 32");
+
+    const int tid    = threadIdx.x;
+    const int warp   = tid >> 5;
+    const int lane   = tid & 31;
+    const int warp_m = warp / WARPS_N;
+    const int warp_n = warp % WARPS_N;
+
+    const int tiles_w   = n / HT;
+    const int blocks_n  = tiles_w / (WARPS_N * NT);
+    const int block_row = blockIdx.x / blocks_n;
+    const int block_col = blockIdx.x % blocks_n;
+    const int row_base  = block_row * BLOCK_M;
+    const int col_base  = block_col * BLOCK_N;
+    const int warp_row0 = row_base + warp_m * 16;
+    const int warp_col0 = col_base + warp_n * NT * 16;
+
+    constexpr int SMEM_A = BLOCK_M * BLOCK_K;
+    constexpr int SMEM_B = BLOCK_N * BLOCK_K;
+    constexpr int SMEM_STAGE = SMEM_A + SMEM_B;
+    constexpr int NTHREADS = WARPS_M * WARPS_N * 32;
+
+    __shared__ __align__(16) int8_t smem_pipe[STAGES * SMEM_STAGE];
+    __shared__ __align__(16) uint32_t sT[WARPS_M * WARPS_N * NT][TRANSCRIPT_LEN];
+
+    if (lane == 0)
+        #pragma unroll
+        for (int nt = 0; nt < NT; ++nt)
+            #pragma unroll
+            for (int i = 0; i < TRANSCRIPT_LEN; ++i) sT[warp * NT + nt][i] = 0;
+
+    int32_t accL[NT][4];
+    int32_t accR[NT][4];
+    #pragma unroll
+    for (int nt = 0; nt < NT; ++nt)
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) { accL[nt][e] = 0; accR[nt][e] = 0; }
+
+    const int T       = k / R;
+    const int INNER_K = R / BLOCK_K;
+
+    for (int t = 0; t < T; ++t) {
+        for (int step = 0; step < INNER_K + STAGES - 1; ++step) {
+            if (step < INNER_K) {                       // ===== PRODUCE (P2: warp < PWARPS) =====
+                const int k_off = t * R + step * BLOCK_K;
+                const int stg   = step % STAGES;
+                int8_t* sA = &smem_pipe[stg * SMEM_STAGE];
+                int8_t* sB = &smem_pipe[stg * SMEM_STAGE + SMEM_A];
+                for (int i = tid * 16; i < SMEM_A; i += blockDim.x * 16) {
+                    const int row = i / BLOCK_K, col = i % BLOCK_K;
+                    cp_async_16B(&sA[swz32(i)], &A[(size_t)(row_base + row) * k + k_off + col]);
+                }
+                for (int i = tid * 16; i < SMEM_B; i += blockDim.x * 16) {
+                    const int col = i / BLOCK_K, row = i % BLOCK_K;
+                    cp_async_16B(&sB[swz32(i)], &Bt[(size_t)(col_base + col) * k + k_off + row]);
+                }
+                cp_async_commit();
+            }
+            if (step >= STAGES - 1) {                    // ===== CONSUME (P2: warp >= PWARPS) =====
+                const int comp = (step - (STAGES - 1)) % STAGES;
+                cp_async_wait_group<STAGES - 2>();
+                nb_sync(0, NTHREADS);                    // P2 -> bar.sync(full[comp])
+                const int8_t* sA = &smem_pipe[comp * SMEM_STAGE];
+                const int8_t* sB = &smem_pipe[comp * SMEM_STAGE + SMEM_A];
+                uint32_t a_frag[4];
+                ldm_A_frag(a_frag, &sA[warp_m * 16 * BLOCK_K]);
+                #pragma unroll
+                for (int nt = 0; nt < NT; ++nt) {
+                    uint32_t bL[2], bR[2];
+                    ldm_B2_frag(bL, bR, &sB[(warp_n * NT * 16 + nt * 16) * BLOCK_K]);
+                    mma_m16n8k32(accL[nt], a_frag, bL, accL[nt]);
+                    mma_m16n8k32(accR[nt], a_frag, bR, accR[nt]);
+                }
+                nb_sync(0, NTHREADS);                    // P2 -> bar.arrive(empty[comp])
+            }
+        }
+        #pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+            uint32_t lx = 0;
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) { lx ^= (uint32_t)accL[nt][e]; lx ^= (uint32_t)accR[nt][e]; }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) lx ^= __shfl_xor_sync(0xffffffffu, lx, off);
+            if (lane == 0) {
+                const int idx = t % TRANSCRIPT_LEN;
+                uint32_t* s = sT[warp * NT + nt];
+                s[idx] = ((s[idx] << HASH_ROT) | (s[idx] >> (32 - HASH_ROT))) ^ lx;
+            }
+        }
+        nb_sync(0, NTHREADS);
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+            const int gi = warp_row0;
+            const int gj = warp_col0 + nt * 16;
+            const int tile_id = (gi / HT) * tiles_w + (gj / HT);
+            uint32_t* tb = &transcript_buffer[(size_t)tile_id * TRANSCRIPT_LEN];
+            uint32_t* s = sT[warp * NT + nt];
+            #pragma unroll
+            for (int i = 0; i < TRANSCRIPT_LEN; i += 4) *((int4*)&tb[i]) = *((int4*)&s[i]);
+        }
+    }
+#else
+    (void)A;(void)Bt;(void)n;(void)k;(void)R;(void)transcript_buffer;
+#endif
+}
+
+template <int BM, int BN, int WM, int WN, int NT, int STG, int MNB>
+cudaError_t launch_ws(const int8_t* A, const int8_t* Bt, int m, int n,
+                      int k, int R, uint32_t* T, cudaStream_t stream) {
+    dim3 block(WM * WN * 32);
+    dim3 grid((unsigned)((m / BM) * (n / BN)));
+    pearl_ampere_ws_kernel<BM, BN, 32, WM, WN, NT, STG, MNB>
+        <<<grid, block, 0, stream>>>(A, Bt, n, k, R, T);
+    return cudaGetLastError();
+}
+
 // ==================================================================
 // ldm_dyn: identical to `ldm` but smem (pipe + transcript) is a single DYNAMIC
 // allocation, so we can opt past the 48 KB static cap (up to 100 KB/SM on Ada via
@@ -1248,14 +1405,19 @@ cudaError_t launch_pearl_ampere(
     dim3 block;
     int grids_m, grids_n;
 
-    // Best on Ada (AD107): `ldm` kernel — wide-style register tiling (NT 16×16
-    // tiles/warp -> NT*2 independent accumulator chains for ILP) + ldmatrix loads
-    // (1 warp instr/fragment) + XOR-swizzled, conflict-free smem. ncu-tuned on the
-    // RTX 4050: 8 -> 21 TH/s. 128×256 (8 warps share the B tile, amortizing the
-    // cp.async loads) is the sweet spot; falls back by decreasing m/n alignment.
+    // Best on Ada (AD107): fused CuTe kernel — int8 GEMM + in-mainloop transcript
+    // fold, multistage cp.async.cg + ldmatrix, <8,1,1> TiledMMA (each warp owns a
+    // 16-row band so the fold is a direct in-register shfl_xor). 32.75 TH/s on the
+    // RTX 4050, bit-exact with DP4A — vs the hand `ldm` kernel's 24.0 (+36%). The
+    // 128×256 region is the real mining shape (4096³ regions, R=256). For R not a
+    // multiple of the 32-wide k-tile the CuTe fold doesn't apply -> hand `ldm`.
     if (m % 128 == 0 && n % 256 == 0) {
+        if (R % block_k == 0) {
+            return pcute::launch_cute_fold<128, 256, 32, 3>(A, Bt, m, n, k, R,
+                                                            transcript_buffer, stream);  // 32.75
+        }
         return launch_ldm<128, 256, 8, 1, 16, 3, 1>(A, Bt, m, n, k, R,
-                                                     transcript_buffer, stream);  // 21.1
+                                                     transcript_buffer, stream);  // 24.0 fallback
     }
     if (m % 64 == 0 && n % 256 == 0) {
         return launch_ldm<64, 256, 4, 1, 16, 4, 1>(A, Bt, m, n, k, R,

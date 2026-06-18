@@ -11,7 +11,6 @@ NVCC="${NVCC:-nvcc}"
 
 # Default arch: Pascal (sm_61) + Ampere (sm_80, sm_86) + Ada (sm_89).
 # The DP4A kernels run on sm_61, tensor-core kernels on sm_80+.
-# Pascal DP4A lives in sm_61 SASS; Ampere+ MMA/cp.async lives in sm_80+ SASS.
 # Override GENCODE to add/remove arches, e.g. for a pure-Ampere farm:
 #   GENCODE="-gencode arch=compute_86,code=sm_86 \
 #            -gencode arch=compute_89,code=sm_89 \
@@ -22,11 +21,9 @@ if [ -z "${GENCODE:-}" ]; then
            -gencode arch=compute_86,code=sm_86 \
            -gencode arch=compute_89,code=sm_89"
 fi
-
 case "$(uname -s)" in
-  *NT*|*MINGW*|*MSYS*) OUT="p40cuda.dll"; CUDART_FLAG="" ;;
-  # Static cudart on Linux -> no libcudart dependency on the mining rig.
-  *) OUT="libp40cuda.so"; CUDART_FLAG="--cudart=static" ;;
+  *NT*|*MINGW*|*MSYS*) OUT="p40cuda.dll" ;;
+  *) OUT="libp40cuda.so" ;;
 esac
 
 SRC=(
@@ -48,6 +45,6 @@ SRC=(
   -I csrc -I csrc/gemm -I csrc/blake3 -I csrc/tensor_hash -I "$CUTLASS_DIR" \
   -Xcompiler -fPIC -std=c++20 --expt-relaxed-constexpr --expt-extended-lambda \
   --use_fast_math $GENCODE -O3 -DNDEBUG -DP40_NO_TORCH \
-  $CUDART_FLAG -allow-unsupported-compiler ${EXTRA_NVCC_FLAGS:-}
+  -allow-unsupported-compiler ${EXTRA_NVCC_FLAGS:-}
 
 echo "built $OUT"

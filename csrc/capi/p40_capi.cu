@@ -44,6 +44,10 @@ void launch_pearl_blake3(const uint32_t*, int, int, const uint32_t*,
 cudaError_t launch_pearl_ampere(const int8_t*, const int8_t*, int, int, int, int,
                                 uint32_t*, cudaStream_t);
 
+// Tensor-core (IMMA) noise-apply GEMM for sm_80+ (pcute::launch_noise_gemm_tc). ~5.6x
+// the DP4A noise kernel on Ada, bit-exact; closes most of the kernel-vs-miner gap.
+#include "pearl_cute_noise.cuh"
+
 // =========================== transpose =====================================
 // Logical src is [rows, cols] with src[r,c] = src_base[r*src_ld + col_off + c]
 // (src_ld/col_off let this transpose a column-slice of a wider matrix without a
@@ -89,14 +93,14 @@ P40_API int p40_sync(void) { return (int)cudaDeviceSynchronize(); }
 // dst[cols,rows] = transpose of the [rows,cols] logical view of src (a column
 // slice of a row-major matrix with leading dim src_ld, starting at col_off).
 P40_API int p40_transpose_i8(const void* src, void* dst, int rows, int cols,
-                             int src_ld, int col_off) {
+                              int src_ld, int col_off) {
   const long total = (long)rows * cols;
   int tpb = 256;
   long blocks = (total + tpb - 1) / tpb;
   if (blocks > 65535) blocks = 65535;
   transpose_i8_kernel<<<(unsigned)blocks, tpb>>>((const int8_t*)src,
-                                                 (int8_t*)dst, rows, cols,
-                                                 src_ld, col_off);
+                                                  (int8_t*)dst, rows, cols,
+                                                  src_ld, col_off);
   return (int)cudaGetLastError();
 }
 
@@ -107,8 +111,8 @@ P40_API int p40_transpose_i8(const void* src, void* dst, int rows, int cols,
 // noise seeds. A, B, Bt, key, nsA, nsB are caller-allocated device buffers
 // (nsA/nsB are 32 bytes). Replaces the ~7s host RNG+commit with ~0.1s on-device.
 P40_API int p40_setup_job(void* A, void* B, void* Bt, const void* key,
-                          void* nsA, void* nsB, int M, int N, int K, int R,
-                          unsigned long long seed) {
+                           void* nsA, void* nsB, int M, int N, int K, int R,
+                           unsigned long long seed) {
   cudaStream_t s = 0;
   launch_fill_rand_i8((int8_t*)A, (int64_t)M * K, seed, s);
   launch_fill_rand_i8((int8_t*)B, (int64_t)K * N, seed + 1, s);
@@ -131,7 +135,7 @@ P40_API int p40_setup_job(void* A, void* B, void* Bt, const void* key,
   tensor_hash((const uint8_t*)Bt, (uint32_t)((int64_t)N * K), B_root,
               (const uint8_t*)key, nbB, tpb, 2, 512, scratch, prop, s);
   commitment_hash_from_merkle_roots(A_root, B_root, (const uint8_t*)key,
-                                    (uint8_t*)nsA, (uint8_t*)nsB, prop, s);
+                                     (uint8_t*)nsA, (uint8_t*)nsB, prop, s);
   cudaError_t e = cudaGetLastError();
   cudaFree(A_root);
   cudaFree(B_root);
@@ -142,36 +146,48 @@ P40_API int p40_setup_job(void* A, void* B, void* Bt, const void* key,
 // Generate the four noise operands. EAR is K-major [R,k], EBL is R-major [k,R]
 // (the corrected layout mapping, matching the torch noise_gen binding).
 P40_API int p40_noise_gen(void* EAL, void* EAR, void* EBL, void* EBR,
-                          const void* key_A, const void* key_B,
-                          int m, int n, int k, int R) {
+                           const void* key_A, const void* key_B,
+                           int m, int n, int k, int R) {
   launch_noise_gen((int8_t*)EAL, (int8_t*)EAR, (int8_t*)EBL, (int8_t*)EBR,
-                   (const uint8_t*)key_A, (const uint8_t*)key_B, m, n, k, R, 0);
+                    (const uint8_t*)key_A, (const uint8_t*)key_B, m, n, k, R, 0);
   return (int)cudaGetLastError();
 }
 
 // A_ns = A + round(EAL @ EAR), int8 (ApEA). AxEBL is the int32 side-product.
 P40_API int p40_noise_apply_A(const void* A, const void* EAL, const void* EAR,
-                              const void* EBL, void* ApEA, void* AxEBL,
-                              int M, int K, int R) {
+                               const void* EBL, void* ApEA, void* AxEBL,
+                               int M, int K, int R) {
   launch_noise_A((const int8_t*)A, (const int8_t*)EAL, (const int8_t*)EAR,
-                 (const int8_t*)EBL, (int8_t*)ApEA, (int32_t*)AxEBL, M, K, R, 0);
+                  (const int8_t*)EBL, (int8_t*)ApEA, (int32_t*)AxEBL, M, K, R, 0);
   return (int)cudaGetLastError();
 }
 
 P40_API int p40_noise_apply_B(const void* B, const void* EBR, const void* EAR,
-                              const void* EBL, void* BpEB, void* EARxBpEB,
-                              int N, int K, int R) {
+                               const void* EBL, void* BpEB, void* EARxBpEB,
+                               int N, int K, int R) {
   launch_noise_B((const int8_t*)B, (const int8_t*)EBR, (const int8_t*)EAR,
-                 (const int8_t*)EBL, (int8_t*)BpEB, (int32_t*)EARxBpEB, N, K, R, 0);
+                  (const int8_t*)EBL, (int8_t*)BpEB, (int32_t*)EARxBpEB, N, K, R, 0);
   return (int)cudaGetLastError();
 }
 
 // Fast noise-apply: out[M,K] = clamp(Z + X @ Y^T over R). For noise_A pass
 // X=EAL, Y=EAR_t, Z=A_slice; for noise_B pass X=EBR, Y=EBL, Z=Bt.
 P40_API int p40_noise_gemm(const void* X, const void* Y, const void* Z, void* out,
-                           int M, int K, int R) {
+                            int M, int K, int R) {
+  // sm_80+: IMMA tensor-core path (bit-exact, ~5.6x DP4A). Pascal / odd shapes: DP4A.
+  static int s_major = -1;
+  if (s_major < 0) {
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) s_major = prop.major;
+    else s_major = 0;
+  }
+  if (s_major >= 8 && (M % 128 == 0) && (K % 256 == 0) && (R % 32 == 0)) {
+    cudaError_t e = pcute::launch_noise_gemm_tc<128, 256, 32, 3>(
+        (const int8_t*)X, (const int8_t*)Y, (const int8_t*)Z, (int8_t*)out, M, K, R, 0);
+    if (e == cudaSuccess) return 0;   // else fall back to DP4A
+  }
   launch_noise_gemm((const int8_t*)X, (const int8_t*)Y, (const int8_t*)Z,
-                    (int8_t*)out, M, K, R, 0);
+                     (int8_t*)out, M, K, R, 0);
   return (int)cudaGetLastError();
 }
 
@@ -184,9 +200,9 @@ P40_API int p40_noise_gemm(const void* X, const void* Y, const void* Z, void* ou
 //   sm_80+ (Ampere/Ada): tensor-core kernel (launch_pearl_ampere) + BLAKE3
 //   pre-sm_80 (Pascal/Volta): DP4A kernel (launch_pearl_gemm_only) + BLAKE3
 P40_API int p40_pearl_pow_split(const void* A, const void* Bt, int m, int n,
-                                int k, int R, const void* key, const void* target,
-                                void* transcript, void* digests, void* found,
-                                void* coord, int variant) {
+                                 int k, int R, const void* key, const void* target,
+                                 void* transcript, void* digests, void* found,
+                                 void* coord, int variant) {
   cudaDeviceProp prop;
   int dev = 0;
   cudaGetDevice(&dev);
@@ -203,11 +219,11 @@ P40_API int p40_pearl_pow_split(const void* A, const void* Bt, int m, int n,
   } else {
     // Pascal DP4A path
     launch_pearl_gemm_only((const int8_t*)A, (const int8_t*)Bt, m, n, k, R, tb,
-                           variant, 0);
+                            variant, 0);
   }
 
   launch_pearl_blake3(tb, num_tiles, n, (const uint32_t*)key,
-                      (const uint32_t*)target, (uint8_t*)digests, (int*)found,
-                      (int*)coord, 0);
+                       (const uint32_t*)target, (uint8_t*)digests, (int*)found,
+                       (int*)coord, 0);
   return (int)cudaGetLastError();
 }

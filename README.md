@@ -1,18 +1,22 @@
 # Open Pearl Miner
 
-A high-performance **Pearl (PRL)** proof-of-work miner optimized for **NVIDIA Pascal GPUs** —
-Tesla P40, GTX 1070 / 1080 (and other `sm_61`, DP4A-capable cards). (Experimental support for sm80+ tensor cores in progress)
+A high-performance **Pearl (PRL)** proof-of-work miner for **NVIDIA GPUs** — Pascal
+(Tesla P40, GTX 1070 / 1080, other `sm_61` DP4A cards) **and Ampere / Ada (`sm_80+`)
+via a fused int8 tensor-core GEMM**.
 
 No Python, CUDA toolkit, or PyTorch required **to run** — the CUDA runtime is bundled
 in pre-built releases. Just an NVIDIA driver and the standalone binary.
-build it yourself or grab a pre-built release. See [License](#license) for dev-fee terms.
+Build it yourself or grab a pre-built release. See [License](#license) for dev-fee terms.
 
-> Mixed-GPU rigs are supported, experimental ternsor core support has been added.
+> Mixed-GPU rigs are supported. Ampere/Ada cards run a fused int8 tensor-core kernel
+> (GEMM + in-mainloop transcript fold + tensor-core noise generation), bit-exact with
+> the Pascal DP4A path; Pascal cards run DP4A.
 > 
 ## Features
 
-- **~7.0 TH/s** sustained on a single Tesla P40.
-- **24 TH/s** on a single RTX 4050 mobile.
+- **~7.0 TH/s** sustained on a single Tesla P40 (Pascal DP4A).
+- **~28 TH/s** on a single RTX 4050 mobile (Ada) — fused int8 **tensor-core** GEMM +
+  in-mainloop transcript fold + tensor-core noise generation, all bit-exact with DP4A.
 - **Multi-GPU** — auto-detects every GPU and runs one worker per card, near-linear scaling.
 - **Continuous mining** — no idle time waiting between pool jobs.
 - **Background proof submission** — finding a share never stalls the search.
@@ -135,7 +139,7 @@ CUTLASS_DIR=... python -c "import p40_pearl_gemm"  # smoke test
 |---|---|---|
 | `--wallet` | _(required)_ | Your Pearl payout address |
 | `--worker` | `p40` | Worker name shown on the pool |
-| `--pool` | `pearl-cpu-eu1.luckypool.io:3370` | Stratum `host:port` |
+| `--pool` | `pearl-eu2.luckypool.io:3360` | Stratum `host:port` (GPU-difficulty pool) |
 | `--devices` | _(auto-detect all)_ | GPU selection, e.g. `0,1,2` or `all` |
 | `--region` | `4096` | Sub-output search size |
 | `--solo` | _(off)_ | Solo mine to local pearl-gateway `HOST:PORT` |
@@ -158,13 +162,15 @@ p40-miner.exe --wallet prl1YOURWALLET --devices 0,2
 
 ### Pool Mining
 
-Default: `pearl-cpu-eu1.luckypool.io:3370` (LuckyPool). Override with `--pool`:
+Default: `pearl-eu2.luckypool.io:3360` (LuckyPool GPU-difficulty pool). Override with `--pool`:
 
 ```
-p40-miner.exe --wallet prl1YOURWALLET --pool pearl-cpu-eu2.luckypool.io:3370
+p40-miner.exe --wallet prl1YOURWALLET --pool pearl-cpu-eu1.luckypool.io:3370
 ```
 
-Currently only LuckyPool's stratum protocol is supported. More pools planned.
+Prefer a GPU-difficulty endpoint (port `3360`) over the CPU pool (`3370`): the CPU
+pool's low difficulty produces frequent shares whose ~1 GB proof snapshot stalls the
+GPU between grids. Currently only LuckyPool's stratum protocol is supported; more planned.
 
 ### Solo Mining
 
@@ -177,13 +183,13 @@ The same 2% dev fee applies (GPU mines to the dev's pool wallet during the 2% wi
 
 ## HiveOS
 
-Download `p40-miner-hiveos-1.2.1.tar.gz` and install it as a **Custom** miner:
+Download `p40-miner-hiveos-1.6.0.tar.gz` and install it as a **Custom** miner:
 
 1. **Flight Sheet → Miner = Custom.**
 2. Set the **Installation URL** to the tarball, *or* `scp` it to the rig and run
-   `tar -C /hive/miners/custom -xzf p40-miner-hiveos-1.2.1.tar.gz`.
+   `tar -C /hive/miners/custom -xzf p40-miner-hiveos-1.6.0.tar.gz`.
 3. **Wallet and worker:** your Pearl wallet `prl1...` (worker name auto-appended).
-4. **Pool URL:** `pearl-cpu-eu1.luckypool.io:3370` (default LuckyPool).
+4. **Pool URL:** `pearl-eu2.luckypool.io:3360` (default LuckyPool GPU pool).
 5. **Extra config arguments** (optional): `--devices 0,1`, `--region 4096`, etc.
 
 The miner reports per-GPU TH/s and accepted shares to the HiveOS dashboard.
